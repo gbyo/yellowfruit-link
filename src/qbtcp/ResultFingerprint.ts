@@ -62,14 +62,24 @@ export function stripCredentialKeys(value: unknown): unknown {
 }
 
 /**
- * Order two keys deterministically.
+ * Compare strings lexicographically by Unicode code point, not by locale or UTF-16 code unit.
  *
- * Codepoint order rather than `localeCompare`, so the same document hashes the same on every machine
- * regardless of its locale.
+ * This is the ordering shared with QBSheet's canonical JSON implementation, so the same document
+ * hashes the same on every machine regardless of its locale or runtime defaults.
  */
-function compareKeys(left: string, right: string): number {
-  if (left < right) return -1;
-  return left > right ? 1 : 0;
+export function compareCodePointOrder(left: string, right: string): number {
+  const leftCodePoints = Array.from(left, (character) => character.codePointAt(0) as number);
+  const rightCodePoints = Array.from(right, (character) => character.codePointAt(0) as number);
+  const commonLength = Math.min(leftCodePoints.length, rightCodePoints.length);
+  for (let index = 0; index < commonLength; index += 1) {
+    if (leftCodePoints[index] !== rightCodePoints[index]) {
+      return leftCodePoints[index] < rightCodePoints[index] ? -1 : 1;
+    }
+  }
+  if (leftCodePoints.length !== rightCodePoints.length) {
+    return leftCodePoints.length < rightCodePoints.length ? -1 : 1;
+  }
+  return 0;
 }
 
 /** Canonical JSON, with object-key order made irrelevant and transport metadata dropped. */
@@ -80,7 +90,7 @@ function canonicalJson(value: unknown): string {
   return `{${Object.entries(value as Record<string, unknown>)
     .filter(([key]) => !ignoredForFingerprint.has(key))
     .filter(([, entry]) => entry !== undefined)
-    .sort(([left], [right]) => compareKeys(left, right))
+    .sort(([left], [right]) => compareCodePointOrder(left, right))
     .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
     .join(',')}}`;
 }
@@ -210,10 +220,10 @@ interface IRecordedResult {
 /**
  * Compare an arriving result against those already recorded for this tournament.
  *
- * Matching order comes from the assignment profile: `Tournament.id` + `Match.id` first, because that
- * is the strongest identity and the reason an assignment preserves its identifiers, then the
- * fingerprint. A same-identity, same-fingerprint arrival is the correct answer to a retry. A
- * same-identity, different-fingerprint arrival is never resolved automatically.
+ * The implemented matching order is fingerprint first, followed by `Match.id` when the arriving
+ * result has one. A same-fingerprint arrival is the correct answer to a retry, while a different
+ * fingerprint with the same match identity is never resolved automatically. This comment describes
+ * the existing check order; it does not prescribe a different matching policy.
  *
  * The tournament half of the identity is the caller's concern: this function is only ever given the
  * results recorded for one tournament, so identical `Match.id` values in different tournaments

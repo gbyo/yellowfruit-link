@@ -78,7 +78,7 @@ function teamObject(team: Team): QbjNode {
 function registrationObjectFor(tournament: Tournament, team: Team): QbjNode {
   const registration = tournament.registrations.find((reg) => reg.teams.includes(team));
   const name = registration?.name ?? team.name;
-  const id = registration?.id ?? `Registration_${team.name}`;
+  const id = registration?.id ?? `Registration_${team.id}`;
   return { type: 'Registration', id, name, teams: [{ $ref: team.id }] };
 }
 
@@ -95,7 +95,7 @@ function registrationObjectFor(tournament: Tournament, team: Team): QbjNode {
  * consumer is not allowed to interpret.
  */
 function stateAwardsBonusExplicitly(scoringRules: QbjNode): void {
-  const answerTypes = scoringRules.answerTypes;
+  const { answerTypes } = scoringRules;
   if (!Array.isArray(answerTypes)) return;
   for (const entry of answerTypes) {
     if (typeof entry !== 'object' || entry === null) continue;

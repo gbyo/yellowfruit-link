@@ -179,30 +179,47 @@ export class AttemptLimiter {
 
   private windowMs: number;
 
+  /** A source that never returns must not be able to grow this map without limit. */
+  private maxWindows: number;
+
   /** Injectable so a test can advance time without waiting out a real window. */
   private now: () => number;
 
-  constructor(maxAttempts: number, windowMs: number, now: () => number = () => Date.now()) {
+  constructor(maxAttempts: number, windowMs: number, now: () => number = () => Date.now(), maxWindows = 4096) {
     this.maxAttempts = maxAttempts;
     this.windowMs = windowMs;
     this.now = now;
+    this.maxWindows = maxWindows;
+  }
+
+  private evictExpired(now: number): void {
+    for (const [source, window] of this.windows) {
+      if (now - window.startedAt > this.windowMs) this.windows.delete(source);
+    }
+  }
+
+  private evictOldestIfFull(): void {
+    if (this.windows.size < this.maxWindows) return;
+    const oldest = this.windows.keys().next().value as string | undefined;
+    if (oldest !== undefined) this.windows.delete(oldest);
   }
 
   /** True when this source has already used its budget. */
   exceeded(source: string): boolean {
+    const now = this.now();
+    this.evictExpired(now);
     const window = this.windows.get(source);
     if (!window) return false;
-    if (this.now() - window.startedAt > this.windowMs) {
-      this.windows.delete(source);
-      return false;
-    }
     return window.count >= this.maxAttempts;
   }
 
   record(source: string): void {
+    const now = this.now();
+    this.evictExpired(now);
     const existing = this.windows.get(source);
-    if (!existing || this.now() - existing.startedAt > this.windowMs) {
-      this.windows.set(source, { count: 1, startedAt: this.now() });
+    if (!existing) {
+      this.evictOldestIfFull();
+      this.windows.set(source, { count: 1, startedAt: now });
       return;
     }
     existing.count += 1;

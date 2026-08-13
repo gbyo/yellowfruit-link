@@ -155,13 +155,17 @@ const createWindow = async () => {
  */
 
 app.on('window-all-closed', () => {
-  // Release the QBTCP port. Not awaited: quitting must not wait on a socket close.
-  shutdownQbtcp();
   // Respect the OSX convention of having the application in memory even
   // after all windows have been closed
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  // Release the QBTCP port only when the application is actually quitting. Not awaited: quitting
+  // must not wait on a socket close, and a stop failure must not become an unhandled rejection.
+  shutdownQbtcp().catch(() => undefined);
 });
 
 app

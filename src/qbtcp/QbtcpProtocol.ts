@@ -46,19 +46,26 @@ export type QbtcpAssignmentState = 'assigned' | 'none' | 'blocked' | 'held';
 /** Default port. Chosen high and unregistered to avoid colliding with dev servers. */
 export const defaultQbtcpPort = 40787;
 
+/** Valid explicit TCP listening ports. Port zero is reserved for OS-assigned ephemeral ports. */
+export const minQbtcpPort = 1;
+export const maxQbtcpPort = 65535;
+
+export function isValidQbtcpPort(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= minQbtcpPort && value <= maxQbtcpPort;
+}
+
 /**
  * Origins allowed to make an authenticated cross-origin request.
  *
  * An exact allowlist, never a wildcard: a wildcard on a capability-token API would let any page on
- * the internet drive a tournament from a scorekeeper's browser. The dev origins are here because
- * QBSheet is developed against a local Vite server.
+ * the internet drive a tournament from a scorekeeper's browser. The dev origins are included only
+ * in development builds because they are for QBSheet's local Vite server.
  */
+const productionAllowedOrigins = ['https://qbsheet.com', 'https://www.qbsheet.com', 'https://gbyo.github.io'];
+
 export const defaultAllowedOrigins = [
-  'https://qbsheet.com',
-  'https://www.qbsheet.com',
-  'https://gbyo.github.io',
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
+  ...productionAllowedOrigins,
+  ...(process.env.NODE_ENV === 'development' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : []),
 ];
 
 /** Hard limits on untrusted input. A body or URL beyond these is refused rather than parsed. */

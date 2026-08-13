@@ -148,6 +148,10 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
   /** Opaque permanent identity for this tournament. Empty until one is generated. See ITournamentExtraData. */
   tournamentId: string = '';
 
+  /** Hook used by TournamentManager's existing dirty-state mechanism. */
+  // eslint-disable-next-line class-methods-use-this
+  onTournamentIdCreated: () => void = () => {};
+
   /** Whether we should use question-by-question data from qbj/MODAQ files. Is always false until we develop features that use it. */
   readonly useQuestionLevelData = false;
 
@@ -178,8 +182,8 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
 
     if (qbjOnly) return qbjObject;
 
-    // Every .yft write carries an identity. Doing it here rather than at load time means opening an
-    // old file does not silently mark it dirty; the id appears the next time the user saves anyway.
+    // Every .yft write carries an identity. An attached TournamentManager is notified when an old
+    // file receives its first identity, so the generated value cannot be lost on a later switch.
     this.ensureTournamentId();
 
     const metadata: ITournamentExtraData = {
@@ -207,7 +211,10 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
    * usable as the tournament half of a result's identity.
    */
   ensureTournamentId(): string {
-    if (!this.tournamentId) this.tournamentId = makeOpaqueId('yft-');
+    if (!this.tournamentId) {
+      this.tournamentId = makeOpaqueId('yft-');
+      this.onTournamentIdCreated();
+    }
     return this.tournamentId;
   }
 

@@ -36,6 +36,7 @@ import { Delete, Edit, FileDownload, PlayArrow, Refresh, Stop } from '@mui/icons
 import { TournamentContext } from '../TournamentManager';
 import YfCard from './YfCard';
 import { IRoomView } from '../../qbtcp/QbtcpState';
+import { isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
 
 function RoomsPage() {
@@ -143,7 +144,10 @@ function ServerCard() {
             sx={{ width: 120 }}
             disabled={status.running || rooms.busy}
             value={rooms.port}
-            onChange={(e) => rooms.setPort(Number.parseInt(e.target.value, 10) || 0)}
+            onChange={(e) => {
+              const port = Number(e.target.value);
+              if (isValidQbtcpPort(port)) rooms.setPort(port);
+            }}
           />
           {status.running ? (
             <Button variant="outlined" startIcon={<Stop />} disabled={rooms.busy} onClick={() => rooms.stopServer()}>
@@ -218,7 +222,18 @@ function RoomRow(props: IRoomRowProps) {
                   Clear
                 </Button>
                 <Tooltip title="Export this assignment as a .qbj file for offline scoring">
-                  <IconButton size="small" onClick={() => rooms.exportAssignment(room.id)}>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      rooms
+                        .exportAssignment(room.id)
+                        .then((exported) => {
+                          if (exported) tournManager.makeToast('Assignment exported');
+                          return undefined;
+                        })
+                        .catch(() => undefined);
+                    }}
+                  >
                     <FileDownload fontSize="small" />
                   </IconButton>
                 </Tooltip>
@@ -236,7 +251,18 @@ function RoomRow(props: IRoomRowProps) {
               </IconButton>
             </Tooltip>
             <Tooltip title="Remove room">
-              <IconButton size="small" onClick={() => rooms.removeRoom(room.id)}>
+              <IconButton
+                size="small"
+                onClick={() =>
+                  tournManager.genericModalManager.open(
+                    'Remove Room',
+                    `Are you sure you want to remove ${room.name}?`,
+                    'N&o',
+                    '&Yes',
+                    () => rooms.removeRoom(room.id).catch(() => undefined),
+                  )
+                }
+              >
                 <Delete fontSize="small" />
               </IconButton>
             </Tooltip>
@@ -244,7 +270,7 @@ function RoomRow(props: IRoomRowProps) {
         </TableCell>
       </TableRow>
 
-      <AssignDialog room={room} isOpen={assignOpen} onClose={() => setAssignOpen(false)} />
+      {assignOpen && <AssignDialog room={room} isOpen onClose={() => setAssignOpen(false)} />}
 
       <Dialog open={renaming} onClose={() => setRenaming(false)}>
         <DialogTitle>Rename room</DialogTitle>

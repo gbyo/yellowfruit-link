@@ -69,6 +69,7 @@ export type QbtcpCommandResult =
   | { ok: true; results: IReceivedResult[] }
   | { ok: true; hasActiveWork: boolean }
   | { ok: true; comparison: ResultComparison }
+  | { ok: true; exported: boolean }
   | { ok: true }
   /** `error` is always safe to show a director, and never contains a credential. */
   | { ok: false; error: string };

@@ -13,7 +13,7 @@ import fs from 'fs';
 import { IpcBidirectional, IpcMainToRend } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
 import { IQbtcpServerStatus, IRoomView } from '../../qbtcp/QbtcpState';
-import { defaultQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { defaultQbtcpPort, isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
 import QbtcpServer, { lanAddresses } from './QbtcpServer';
 import QbtcpStore from './QbtcpStore';
 
@@ -54,6 +54,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
       ? state.sessions.find((s) => s.roomId === room.id && s.matchId === assignment.matchId)
       : state.sessions.find((s) => s.roomId === room.id);
     const presence = state.presence.find((p) => p.roomId === room.id);
+    const tossupsRead = readTossupsRead(session?.progressMatch);
     // The newest result for this room is the one a director acts on.
     const result = [...state.results].reverse().find((r) => r.roomId === room.id);
 
@@ -84,9 +85,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
             session: {
               id: session.id,
               scoring: session.progressSequence > 0,
-              ...(readTossupsRead(session.progressMatch) !== undefined
-                ? { tossupsRead: readTossupsRead(session.progressMatch) }
-                : {}),
+              ...(tossupsRead !== undefined ? { tossupsRead } : {}),
               finalReceived: session.finalReceived,
             },
           }
@@ -141,7 +140,7 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
     case 'status':
       return { ok: true, status: buildStatus(instance) };
     case 'start':
-      await instance.start(Number.isInteger(command.port) ? command.port : defaultQbtcpPort);
+      await instance.start(isValidQbtcpPort(command.port) ? command.port : defaultQbtcpPort);
       return { ok: true, status: buildStatus(instance) };
     case 'stop':
       await instance.stop();
@@ -194,10 +193,10 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
         defaultPath: command.suggestedFileName,
         filters: [{ name: 'QBJ file', extensions: ['qbj'] }],
       });
-      if (chosen.canceled || !chosen.filePath) return { ok: true };
+      if (chosen.canceled || !chosen.filePath) return { ok: true, exported: false };
       // The stored document, not a rebuild: this is the same object the network serves.
       await fs.promises.writeFile(chosen.filePath, JSON.stringify(assignment.document), 'utf8');
-      return { ok: true };
+      return { ok: true, exported: true };
     }
     default:
       return { ok: false, error: 'That Rooms command is not supported by this version.' };

@@ -1,5 +1,6 @@
 import { createContext } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
+import { AlertColor } from '@mui/material';
 import Tournament, { IYftFileTournament, NullTournament } from './DataModel/Tournament';
 import { dateFieldChanged, getFileNameFromPath, textFieldChanged, versionLt } from './Utils/GeneralUtils';
 import { NullObjects } from './Utils/UtilTypes';
@@ -40,7 +41,6 @@ import { parseOldYfFile, isOldYftFile } from './DataModel/OldYfParsing';
 import parseTeamsFromSqbsFile from './DataModel/SqbsParsing';
 import SqbsExportModalManager from './Modal Managers/SqbsExportModalManager';
 import SqbsGenerator from './DataModel/SqbsFileGeneration';
-import { AlertColor } from '@mui/material';
 import RoomsManager from './Modal Managers/RoomsManager';
 import { IReceivedResult } from '../qbtcp/QbtcpState';
 import { QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
@@ -114,7 +114,7 @@ export class TournamentManager {
   /** The version of the app that is currently running */
   appVersion: string = '';
 
-  /** The latest published version of the app that's available to download*/
+  /** The latest published version of the app that's available to download */
   latestAvailVersion: string = '';
 
   /** Rooms adapter state for the import currently under review. See closeMatchImportModal. */
@@ -130,6 +130,15 @@ export class TournamentManager {
 
   /** QBTCP results whose review is open. Resolved when the director commits or cancels. */
   private pendingQbtcpResultIds: string[] = [];
+
+  /** Results received while another import or review is active. They are reviewed one at a time. */
+  private queuedQbtcpResults: IReceivedResult[] = [];
+
+  /** Prevents two asynchronous import preparations from sharing one review modal. */
+  private qbtcpReviewInProgress: boolean = false;
+
+  /** Keeps queued QBTCP reviews behind the bookkeeping for the modal that just closed. */
+  private roomsBookkeepingInProgress: boolean = false;
 
   constructor() {
     this.dataChangedReactCallback = () => {};
@@ -238,7 +247,7 @@ export class TournamentManager {
     window.electron.ipcRenderer.sendMessage(IpcBidirectional.LoadBackup);
   }
 
-  //eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this
   protected checkForNewVersion() {
     window.electron.ipcRenderer.sendMessage(IpcBidirectional.CheckForNewVersion);
   }
@@ -280,10 +289,10 @@ export class TournamentManager {
   private newTournament() {
     this.tournament = new Tournament();
     this.tournament.appVersion = this.appVersion;
+    this.unsavedData = false;
     this.modalManagersSetTournament();
     this.setFilePath(null);
     this.displayName = '';
-    this.unsavedData = false;
 
     this.setWindowTitle();
     this.dataChangedReactCallback();
@@ -355,9 +364,9 @@ export class TournamentManager {
 
     this.setFilePath(filePath as string);
     this.tournament = loadedTournament;
+    this.unsavedData = false;
     this.modalManagersSetTournament();
     this.displayName = this.tournament.name || '';
-    this.unsavedData = false;
     this.setWindowTitle();
     this.dataChangedReactCallback();
   }
@@ -597,7 +606,13 @@ export class TournamentManager {
     for (const oneFile of fileAry) {
       const { filePath, fileContents } = oneFile;
       const objFromFile = this.parseJSON(fileContents);
-      if (!objFromFile) return;
+      if (!objFromFile) {
+        const badFile = new MatchImportResult(filePath);
+        badFile.markFatal('This file does not contain valid JSON.');
+        results.push(badFile);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
 
       // Identity is read from the raw document, before case conversion, and from a plain parse rather
       // than the date-aware one. The QBTCP path fingerprints a plain parse of the same bytes, so both
@@ -908,9 +923,12 @@ export class TournamentManager {
   modalManagersSetTournament() {
     this.teamModalManager.tournament = this.tournament;
     this.matchModalManager.tournament = this.tournament;
+    this.tournament.onTournamentIdCreated = () => this.markFileDirty();
     // Point the Rooms adapter at whatever tournament is now open. Every path that replaces the
     // tournament comes through here, so this is the one place that has to know.
-    this.roomsManager.bind(this.tournament);
+    this.roomsManager.bind(this.tournament).catch((error) => {
+      this.makeToast(`Rooms adapter could not bind to this tournament: ${(error as Error).message}`, 'error');
+    });
   }
 
   /** Keep track of which view the user is on, so that they can leave the Teams page, then
@@ -1508,45 +1526,60 @@ export class TournamentManager {
    * save will include it.
    */
   private async finishRoomsBookkeeping(shouldSave: boolean) {
+    this.roomsBookkeepingInProgress = true;
     const documents = this.pendingFileResultsToRecord;
     const resultIds = this.pendingQbtcpResultIds;
     this.pendingFileResultsToRecord = [];
     this.pendingQbtcpResultIds = [];
 
-    if (!shouldSave) {
-      // Nothing was imported, so nothing is recorded and the results stay available for review.
-      return;
-    }
-
-    for (const contents of documents) {
-      try {
-        const document = JSON.parse(contents);
-        // eslint-disable-next-line no-await-in-loop
-        await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
-          kind: 'recordFileResult',
-          document,
-        });
-      } catch {
-        // The adapter is optional; a failure here cannot be allowed to undo a completed import.
+    try {
+      if (!shouldSave) {
+        // Nothing was imported, so nothing is recorded and the results stay available for review.
+        return;
       }
-    }
 
-    for (const resultId of resultIds) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
-          kind: 'resolveResult',
-          resultId,
-          status: 'accepted',
-        });
-      } catch {
-        // Same: the match is already in the tournament, which is the part that matters.
+      for (const contents of documents) {
+        try {
+          const document = JSON.parse(contents);
+          // eslint-disable-next-line no-await-in-loop
+          const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+            kind: 'recordFileResult',
+            document,
+          })) as QbtcpCommandResult | undefined;
+          if (!reply?.ok) {
+            this.makeToast(`Rooms: could not record imported result: ${reply?.error ?? 'no reply received'}`, 'error');
+          }
+        } catch {
+          // The adapter is optional; a failure here cannot be allowed to undo a completed import.
+        }
       }
-    }
 
-    if (documents.length > 0 || resultIds.length > 0) {
-      this.saveBackup();
-      this.roomsManager.refresh();
+      for (const resultId of resultIds) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+            kind: 'resolveResult',
+            resultId,
+            status: 'accepted',
+          })) as QbtcpCommandResult | undefined;
+          if (!reply?.ok) {
+            this.makeToast(
+              `Rooms: could not resolve result ${resultId}: ${reply?.error ?? 'no reply received'}`,
+              'error',
+            );
+          }
+        } catch {
+          // Same: the match is already in the tournament, which is the part that matters.
+        }
+      }
+
+      if (documents.length > 0 || resultIds.length > 0) {
+        this.saveBackup();
+        this.roomsManager.refresh();
+      }
+    } finally {
+      this.roomsBookkeepingInProgress = false;
+      this.startNextQbtcpReview().catch(() => undefined);
     }
   }
 
@@ -1559,10 +1592,29 @@ export class TournamentManager {
    * match this tournament's rosters.
    */
   handleQbtcpResultReceived(result: IReceivedResult) {
-    this.pendingQbtcpResultIds.push(result.id);
-    const label = `${result.roundNumber ? `Round ${result.roundNumber}` : 'Room result'} (QBSheet)`;
-    this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(result.document) }]);
+    this.queuedQbtcpResults.push(result);
     this.roomsManager.refresh();
+    this.startNextQbtcpReview().catch(() => undefined);
+  }
+
+  private async startNextQbtcpReview(): Promise<void> {
+    if (this.matchImportResultsManager.modalIsOpen || this.qbtcpReviewInProgress || this.roomsBookkeepingInProgress)
+      return;
+    const next = this.queuedQbtcpResults.shift();
+    if (!next) return;
+
+    this.qbtcpReviewInProgress = true;
+    this.pendingQbtcpResultIds.push(next.id);
+    const label = `${next.roundNumber ? `Round ${next.roundNumber}` : 'Room result'} (QBSheet)`;
+    try {
+      await this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(next.document) }]);
+    } catch (error) {
+      this.pendingQbtcpResultIds = this.pendingQbtcpResultIds.filter((id) => id !== next.id);
+      this.makeToast(`Rooms: could not review result: ${(error as Error).message}`, 'error');
+    } finally {
+      this.qbtcpReviewInProgress = false;
+      if (!this.matchImportResultsManager.modalIsOpen) this.startNextQbtcpReview().catch(() => undefined);
+    }
   }
 
   openPhaseModal(phase: Phase) {

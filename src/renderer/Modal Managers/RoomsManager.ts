@@ -18,7 +18,7 @@ import { createContext } from 'react';
 import { IpcBidirectional } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
 import { IQbtcpServerStatus } from '../../qbtcp/QbtcpState';
-import { defaultQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { defaultQbtcpPort, isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
 import { makeOpaqueId } from '../../SharedUtils';
 import { assignmentFileName, buildAssignmentDocument } from '../DataModel/QbjAssignment';
 import { Round } from '../DataModel/Round';
@@ -48,6 +48,12 @@ export default class RoomsManager {
   /** True while a command is outstanding, so the page can disable its buttons. */
   busy: boolean = false;
 
+  /** Number of commands still awaiting a reply. */
+  private inFlight: number = 0;
+
+  /** Sequence assigned to the newest command, so older replies cannot replace newer state. */
+  private nextRequestId: number = 0;
+
   /** Replaced by the Rooms page while it is mounted. */
   dataChangedReactCallback: () => void = noop;
 
@@ -55,22 +61,30 @@ export default class RoomsManager {
   getTournament: () => Tournament = newEmptyTournament;
 
   private async send(command: QbtcpCommand): Promise<QbtcpCommandResult> {
+    const requestId = ++this.nextRequestId;
+    this.inFlight += 1;
     this.busy = true;
-    this.dataChangedReactCallback();
-    let reply: QbtcpCommandResult;
+    let reply: QbtcpCommandResult = { ok: false, error: 'The Rooms adapter did not respond.' };
     try {
-      reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, command)) as QbtcpCommandResult;
+      this.dataChangedReactCallback();
+      reply =
+        ((await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, command)) as QbtcpCommandResult) ??
+        reply;
     } catch (error) {
       reply = { ok: false, error: (error as Error).message || 'The Rooms adapter did not respond.' };
+    } finally {
+      this.inFlight -= 1;
+      this.busy = this.inFlight > 0;
+      if (requestId === this.nextRequestId) {
+        if (reply.ok) {
+          this.lastError = undefined;
+          if ('status' in reply) this.status = reply.status;
+        } else {
+          this.lastError = reply.error;
+        }
+      }
+      this.dataChangedReactCallback();
     }
-    this.busy = false;
-    if (reply?.ok) {
-      this.lastError = undefined;
-      if ('status' in reply) this.status = reply.status;
-    } else {
-      this.lastError = reply?.error ?? 'The Rooms adapter did not respond.';
-    }
-    this.dataChangedReactCallback();
     return reply;
   }
 
@@ -101,6 +115,7 @@ export default class RoomsManager {
   }
 
   setPort(port: number): void {
+    if (!isValidQbtcpPort(port)) return;
     this.port = port;
     this.dataChangedReactCallback();
   }
@@ -137,7 +152,11 @@ export default class RoomsManager {
       return;
     }
     const room = this.status.rooms.find((entry) => entry.id === roomId);
-    if (!room) return;
+    if (!room) {
+      this.lastError = 'That room could not be found.';
+      this.dataChangedReactCallback();
+      return;
+    }
 
     const matchId = makeOpaqueId('Match_', 8);
     const document = buildAssignmentDocument({
@@ -174,14 +193,14 @@ export default class RoomsManager {
    * serving, so a room that scores from this file and a room that scores over the network have
    * provably the same document. This is the fallback that has to work when the network does not.
    */
-  async exportAssignment(roomId: string): Promise<void> {
+  async exportAssignment(roomId: string): Promise<boolean> {
     const room = this.status.rooms.find((entry) => entry.id === roomId);
     if (!room?.assignment) {
       this.lastError = 'That room has no assignment to export.';
       this.dataChangedReactCallback();
-      return;
+      return false;
     }
-    await this.send({
+    const reply = await this.send({
       kind: 'exportAssignment',
       roomId,
       suggestedFileName: assignmentFileName({
@@ -191,6 +210,7 @@ export default class RoomsManager {
         rightTeamName: room.assignment.rightTeamName,
       }),
     });
+    return reply.ok && 'exported' in reply && reply.exported;
   }
 
   /** Whether switching tournaments would abandon scored work. Asked before a destructive switch. */

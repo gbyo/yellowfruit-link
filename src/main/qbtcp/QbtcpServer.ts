@@ -74,6 +74,10 @@ import {
   urlTooLong,
 } from './HttpUtils';
 
+/** Escaped so a future protocol prefix cannot be interpreted as a regular expression. */
+const escapedQbtcpPrefix = qbtcpPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const sessionRoutePattern = new RegExp(`^${escapedQbtcpPrefix}/sessions/([^/]+)/(writer|progress|result|recovery)$`);
+
 export interface IQbtcpServerHooks {
   /** A final was received and is durably stored. The renderer runs the shared importer from here. */
   onResultReceived: (result: IReceivedResult) => void;
@@ -93,6 +97,9 @@ export default class QbtcpServer {
   private listenPort?: number;
 
   private lastError?: string;
+
+  /** Serializes lifecycle commands so a close fully completes before another bind. */
+  private lifecycleChain: Promise<void> = Promise.resolve();
 
   /** A problem loading saved state, kept so the Rooms page can report it without hiding the tournament. */
   private stateProblem?: string;
@@ -147,6 +154,20 @@ export default class QbtcpServer {
   }
 
   async start(port: number): Promise<void> {
+    return this.runExclusively(() => this.startInner(port));
+  }
+
+  async stop(): Promise<void> {
+    return this.runExclusively(() => this.stopInner());
+  }
+
+  private runExclusively(work: () => Promise<void>): Promise<void> {
+    const run = this.lifecycleChain.then(work);
+    this.lifecycleChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async startInner(port: number): Promise<void> {
     if (this.server) return;
     this.lastError = undefined;
     const server = createServer((request, response) => {
@@ -175,35 +196,39 @@ export default class QbtcpServer {
       server.once('listening', onListening);
       // Bound to all interfaces on purpose: a room on the tournament's Wi-Fi has to reach it.
       server.listen(port);
-    }).catch((error) => {
-      server.close();
+    }).catch(async (error) => {
+      await closeServer(server);
       throw error;
     });
 
-    // After startup, a socket error must not be fatal.
-    server.on('error', (error) => {
-      this.lastError = describeListenError(error, port);
-      this.hooks.onStateChanged();
-    });
+    try {
+      // After startup, a socket error must not be fatal.
+      server.on('error', (error) => {
+        this.lastError = describeListenError(error, port);
+        this.hooks.onStateChanged();
+      });
 
-    this.server = server;
-    // The port the socket actually bound to, which is not the requested one when 0 was passed to let
-    // the OS choose. Everything a director is shown - and every address a room is given - comes from
-    // here, so it has to be the real one.
-    const address = server.address();
-    this.listenPort = typeof address === 'object' && address !== null ? address.port : port;
+      // The port the socket actually bound to, which is not the requested one when 0 was passed to
+      // let the OS choose. Everything a director is shown - and every address a room is given -
+      // comes from here, so it has to be the real one.
+      const address = server.address();
+      const listenPort = typeof address === 'object' && address !== null ? address.port : port;
+      this.server = server;
+      this.listenPort = listenPort;
+    } catch (error) {
+      await closeServer(server);
+      throw error;
+    }
   }
 
-  async stop(): Promise<void> {
+  private async stopInner(): Promise<void> {
     const { server } = this;
     if (!server) return;
-    this.server = undefined;
-    this.listenPort = undefined;
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-      // Idle keep-alive sockets would otherwise hold the close open.
-      server.closeAllConnections?.();
-    });
+    await closeServer(server);
+    if (this.server === server) {
+      this.server = undefined;
+      this.listenPort = undefined;
+    }
   }
 
   // --- state the renderer drives -------------------------------------------------------------
@@ -322,6 +347,9 @@ export default class QbtcpServer {
   async recordFileResult(document: object): Promise<void> {
     const identity = readResultIdentity(document);
     if (!identity) return;
+    if (identity.tournamentId && identity.tournamentId !== this.state.tournamentId) {
+      throw new Error('That result belongs to a different tournament.');
+    }
     const comparison = compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
       this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
@@ -392,9 +420,11 @@ export default class QbtcpServer {
     }
 
     if (path === `${qbtcpPrefix}/rooms` && method === 'GET') {
+      const room = this.authorizeRoom(request, response);
+      if (!room) return;
       // Identifiers and display names only. No token and no pairing code.
       sendJson(response, 200, {
-        rooms: this.state.rooms.filter((room) => room.enabled).map((room) => ({ id: room.id, name: room.name })),
+        rooms: this.state.rooms.filter((entry) => entry.enabled).map((entry) => ({ id: entry.id, name: entry.name })),
       });
       return;
     }
@@ -450,7 +480,7 @@ export default class QbtcpServer {
       return;
     }
 
-    const sessionRoute = /^\/qbtcp\/v1\/sessions\/([^/]+)\/(writer|progress|result|recovery)$/.exec(path);
+    const sessionRoute = sessionRoutePattern.exec(path);
     if (sessionRoute) {
       await this.handleSessionRoute(decodeURIComponent(sessionRoute[1]), sessionRoute[2], method, request, response);
       return;
@@ -510,7 +540,7 @@ export default class QbtcpServer {
 
     // A fresh token per pairing: a device that pairs again invalidates the previous one, which is
     // how a room recovers from a token that leaked onto a projector.
-    room.roomToken = makeOpaqueId('rt-', 24);
+    room.roomToken = `rt-${randomBytes(24).toString('hex')}`;
     await this.store.save(this.state);
     this.pairingLimiter.clear(source);
     this.hooks.onStateChanged();
@@ -618,7 +648,7 @@ export default class QbtcpServer {
       id: makeOpaqueId('sess-', 8),
       roomId: room.id,
       matchId,
-      sessionToken: makeOpaqueId('st-', 24),
+      sessionToken: `st-${randomBytes(24).toString('hex')}`,
       writerDeviceId: deviceId ?? null,
       progressSequence: 0,
       finalReceived: false,
@@ -751,6 +781,10 @@ export default class QbtcpServer {
       sendJson(response, 400, { error: 'That result contained no match this server could read.' });
       return;
     }
+    if (identity.tournamentId && identity.tournamentId !== this.state.tournamentId) {
+      sendJson(response, 409, { error: 'That result belongs to a different tournament.' });
+      return;
+    }
 
     const comparison = compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
@@ -760,6 +794,7 @@ export default class QbtcpServer {
     if (comparison.kind === 'duplicate') {
       // The correct answer to a retry, and not an error. No second result is recorded.
       session.finalReceived = true;
+      session.updatedAt = new Date().toISOString();
       await this.store.save(this.state);
       sendJson(response, 200, {
         accepted: true,
@@ -767,6 +802,7 @@ export default class QbtcpServer {
         fingerprint: identity.fingerprint,
         duplicate: true,
       });
+      this.hooks.onStateChanged();
       return;
     }
 
@@ -898,6 +934,19 @@ function sendJson(response: ServerResponse, status: number, body: object, conten
   response.end(text);
 }
 
+/** Close a server and release all idle connections before the next lifecycle operation. */
+async function closeServer(server: Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+    // Idle keep-alive sockets would otherwise hold the close open.
+    server.closeAllConnections?.();
+  });
+}
+
 /**
  * A pairing code a person can read aloud and type without ambiguity.
  *
@@ -905,7 +954,15 @@ function sendJson(response: ServerResponse, status: number, body: object, conten
  * off a card and long enough that guessing it inside the rate limit is not worth attempting.
  */
 function makePairingCode(): string {
-  return Array.from(randomBytes(8), (byte) => String(byte % 10)).join('');
+  let code = '';
+  while (code.length < 8) {
+    for (const byte of randomBytes(8)) {
+      if (byte >= 250) continue;
+      code += String(byte % 10);
+      if (code.length === 8) break;
+    }
+  }
+  return code;
 }
 
 /** The bucket a pairing attempt is counted against. */
