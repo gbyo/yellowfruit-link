@@ -214,28 +214,36 @@ function RoomRow(props: IRoomRowProps) {
         </TableCell>
         <TableCell align="right">
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-            <Button
-              size="small"
-              disabled={assignmentLocked}
+            <Tooltip
+              describeChild
               title={
-                assignmentLocked ? 'Finish the current scoring session before changing the assignment.' : undefined
+                assignmentLocked ? 'Finish the current scoring session before changing the assignment.' : ''
               }
-              onClick={() => setAssignOpen(true)}
             >
-              {room.assignment ? 'Change' : 'Assign'}
-            </Button>
+              <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
+                <Button size="small" disabled={assignmentLocked} onClick={() => setAssignOpen(true)}>
+                  {room.assignment ? 'Change' : 'Assign'}
+                </Button>
+              </span>
+            </Tooltip>
             {room.assignment && (
               <>
-                <Button
-                  size="small"
-                  disabled={assignmentLocked}
+                <Tooltip
+                  describeChild
                   title={
-                    assignmentLocked ? 'Finish the current scoring session before clearing the assignment.' : undefined
+                    assignmentLocked ? 'Finish the current scoring session before clearing the assignment.' : ''
                   }
-                  onClick={() => rooms.clearAssignment(room.id)}
                 >
-                  Clear
-                </Button>
+                  <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
+                    <Button
+                      size="small"
+                      disabled={assignmentLocked}
+                      onClick={() => rooms.clearAssignment(room.id)}
+                    >
+                      Clear
+                    </Button>
+                  </span>
+                </Tooltip>
                 <Tooltip title="Export this assignment as a .qbj file for offline scoring">
                   <IconButton
                     size="small"
@@ -265,21 +273,29 @@ function RoomRow(props: IRoomRowProps) {
                 <Edit fontSize="small" />
               </IconButton>
             </Tooltip>
-            <Tooltip title="Remove room">
-              <IconButton
-                size="small"
-                onClick={() =>
-                  tournManager.genericModalManager.open(
-                    'Remove Room',
-                    `Are you sure you want to remove ${room.name}?`,
-                    'N&o',
-                    '&Yes',
-                    () => rooms.removeRoom(room.id).catch(() => undefined),
-                  )
-                }
-              >
-                <Delete fontSize="small" />
-              </IconButton>
+            <Tooltip
+              describeChild
+              title={
+                assignmentLocked ? 'Finish the current scoring session before removing the room.' : 'Remove room'
+              }
+            >
+              <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
+                <IconButton
+                  size="small"
+                  disabled={assignmentLocked}
+                  onClick={() =>
+                    tournManager.genericModalManager.open(
+                      'Remove Room',
+                      `Are you sure you want to remove ${room.name}?`,
+                      'N&o',
+                      '&Yes',
+                      () => rooms.removeRoom(room.id).catch(() => undefined),
+                    )
+                  }
+                >
+                  <Delete fontSize="small" />
+                </IconButton>
+              </span>
             </Tooltip>
           </Stack>
         </TableCell>
