@@ -1,3 +1,4 @@
+import { makeOpaqueId } from '../../SharedUtils';
 import { sumReduce, versionLt } from '../Utils/GeneralUtils';
 // eslint-disable-next-line import/no-cycle
 import { NullDate, NullObjects } from '../Utils/UtilTypes';
@@ -64,6 +65,16 @@ export interface IYftFileTournament extends IQbjTournament, IYftFileObject {
 interface ITournamentExtraData {
   /** Version of this software used to write the file */
   YfVersion: string;
+  /**
+   * Opaque, permanent identity for this tournament.
+   *
+   * Optional so that a .yft file written before this field existed still parses; one is generated
+   * the next time the file is saved. Lives in YfData rather than in the QBJ body so that it never
+   * appears in a generic QBJ export - the one exception is the Rooms/QBTCP assignment and result
+   * path, which deliberately uses it as the QBJ `Tournament.id`, because result deduplication needs
+   * a tournament identity that is stable across save/reopen.
+   */
+  tournamentId?: string;
   standardRuleSet?: CommonRuleSets;
   seeds: IQbjRefPointer[];
   trackPlayerYear: boolean;
@@ -134,6 +145,13 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
 
   appVersion: string = '';
 
+  /** Opaque permanent identity for this tournament. Empty until one is generated. See ITournamentExtraData. */
+  tournamentId: string = '';
+
+  /** Hook used by TournamentManager's existing dirty-state mechanism. */
+  // eslint-disable-next-line class-methods-use-this
+  onTournamentIdCreated: () => void = () => {};
+
   /** Whether we should use question-by-question data from qbj/MODAQ files. Is always false until we develop features that use it. */
   readonly useQuestionLevelData = false;
 
@@ -164,8 +182,13 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
 
     if (qbjOnly) return qbjObject;
 
+    // Every .yft write carries an identity. An attached TournamentManager is notified when an old
+    // file receives its first identity, so the generated value cannot be lost on a later switch.
+    this.ensureTournamentId();
+
     const metadata: ITournamentExtraData = {
       YfVersion: this.appVersion,
+      tournamentId: this.tournamentId,
       standardRuleSet: this.standardRuleSet,
       seeds: this.seeds.map((team) => team.toRefPointer()),
       trackPlayerYear: this.trackPlayerYear,
@@ -179,6 +202,20 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
     const yftFileObj = { YfData: metadata, ...qbjObject };
 
     return yftFileObj;
+  }
+
+  /**
+   * Give this tournament a permanent identity if it doesn't have one, and return it.
+   *
+   * Idempotent: once set, the value never changes for the life of the file, which is what makes it
+   * usable as the tournament half of a result's identity.
+   */
+  ensureTournamentId(): string {
+    if (!this.tournamentId) {
+      this.tournamentId = makeOpaqueId('yft-');
+      this.onTournamentIdCreated();
+    }
+    return this.tournamentId;
   }
 
   compileStats(fullReport: boolean = false, sortByFinalRank: boolean = false) {

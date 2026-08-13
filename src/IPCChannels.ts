@@ -63,6 +63,10 @@ export enum IpcMainToRend {
   LaunchAboutYf = 'LaunchAboutYf',
   /** QBJ game import workflow, triggered by Main process */
   ImportQbjGamesMainLaunch = 'ImportQbjGamesMainLaunch',
+  /** A QBTCP final arrived and is durably stored. Carries an IReceivedResult. */
+  QbtcpResultReceived = 'QbtcpResultReceived',
+  /** Room presence/session/progress changed; the Rooms page should refresh its status. */
+  QbtcpStateChanged = 'QbtcpStateChanged',
 }
 
 /** Channels for both directions renderer<-->main */
@@ -80,6 +84,14 @@ export enum IpcBidirectional {
   SqbsExport = 'SqbsExport',
   /** See if there's a newer version the user should condider downloading */
   CheckForNewVersion = 'CheckForNewVersion',
+  /**
+   * The Rooms/QBTCP adapter surface.
+   *
+   * All of these are request/response rather than fire-and-forget, because the Rooms page has to be
+   * able to tell the director that something did not happen - a port that was refused, a room that
+   * could not be removed safely - rather than showing an optimistic state that isn't true.
+   */
+  QbtcpCommand = 'QbtcpCommand',
 }
 
 export type IpcChannels = IpcRendToMain | IpcMainToRend | IpcBidirectional;
@@ -100,6 +112,8 @@ export const rendererListenableEvents = [
   IpcMainToRend.ImportSqbsTeams,
   IpcMainToRend.MakeToast,
   IpcMainToRend.ImportQbjGamesMainLaunch,
+  IpcMainToRend.QbtcpResultReceived,
+  IpcMainToRend.QbtcpStateChanged,
   IpcMainToRend.LaunchAboutYf,
   IpcBidirectional.LoadBackup,
   IpcBidirectional.ExportQbjFile,
@@ -107,4 +121,5 @@ export const rendererListenableEvents = [
   IpcBidirectional.GetAppVersion,
   IpcBidirectional.SqbsExport,
   IpcBidirectional.CheckForNewVersion,
+  IpcBidirectional.QbtcpCommand,
 ];

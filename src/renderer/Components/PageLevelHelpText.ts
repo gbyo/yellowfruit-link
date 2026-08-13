@@ -109,6 +109,32 @@ const GamesPageHelpText: HelpTextSection[] = [
   },
 ];
 
+const RoomsPageHelpText: HelpTextSection[] = [
+  {
+    content: [
+      'Rooms is an optional way to collect results from QBSheet scoresheets over your local network. Everything on this page is extra: YellowFruit works exactly the same way with the server stopped, and you never have to use it.',
+    ],
+  },
+  {
+    header: 'Getting a room scoring',
+    content: [
+      "Start the server, add a room, and assign it a round and two teams. Give the scorekeeper one of the addresses shown here and that room's pairing code. QBSheet will then download the game and score it.",
+    ],
+  },
+  {
+    header: 'Reviewing results',
+    content: [
+      'When a room finishes, its result is saved immediately and shown here as needing review. Reviewing it opens the same import window you get from Games → Import, with the same checks, and the game is only added once you accept it.',
+    ],
+  },
+  {
+    header: 'If the network fails',
+    content: [
+      'Use the download button on a room to export its assignment as a .qbj file. A scorekeeper can open that in QBSheet with no network at all, score the game, download a result file, and you can bring it in through Games → Import as usual. If a result arrives both ways, YellowFruit recognizes the second copy instead of adding the game twice.',
+    ],
+  },
+];
+
 const StatReportPageHelpText: HelpTextSection[] = [
   {
     content: [
@@ -129,6 +155,8 @@ export default function getAppPageHelpText(page: ApplicationPages) {
       return TeamsPageHelpText;
     case ApplicationPages.Games:
       return GamesPageHelpText;
+    case ApplicationPages.Rooms:
+      return RoomsPageHelpText;
     case ApplicationPages.StatReport:
       return StatReportPageHelpText;
     default:

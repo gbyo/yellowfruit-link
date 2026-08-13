@@ -1,5 +1,6 @@
 import { createContext } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
+import { AlertColor } from '@mui/material';
 import Tournament, { IYftFileTournament, NullTournament } from './DataModel/Tournament';
 import { dateFieldChanged, getFileNameFromPath, textFieldChanged, versionLt } from './Utils/GeneralUtils';
 import { NullObjects } from './Utils/UtilTypes';
@@ -40,7 +41,10 @@ import { parseOldYfFile, isOldYftFile } from './DataModel/OldYfParsing';
 import parseTeamsFromSqbsFile from './DataModel/SqbsParsing';
 import SqbsExportModalManager from './Modal Managers/SqbsExportModalManager';
 import SqbsGenerator from './DataModel/SqbsFileGeneration';
-import { AlertColor } from '@mui/material';
+import RoomsManager from './Modal Managers/RoomsManager';
+import { IReceivedResult } from '../qbtcp/QbtcpState';
+import { QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
+import { ResultComparison } from '../qbtcp/ResultFingerprint';
 
 /** Holds the tournament the application is currently editing */
 export class TournamentManager {
@@ -110,8 +114,31 @@ export class TournamentManager {
   /** The version of the app that is currently running */
   appVersion: string = '';
 
-  /** The latest published version of the app that's available to download*/
+  /** The latest published version of the app that's available to download */
   latestAvailVersion: string = '';
+
+  /** Rooms adapter state for the import currently under review. See closeMatchImportModal. */
+  roomsManager: RoomsManager;
+
+  /**
+   * Raw documents from the import under review that were new to the Rooms adapter.
+   *
+   * Held until the director commits the import, then recorded. Recording them at parse time would put
+   * a result on record that a cancelled import never turned into a match.
+   */
+  private pendingFileResultsToRecord: string[] = [];
+
+  /** QBTCP results whose review is open. Resolved when the director commits or cancels. */
+  private pendingQbtcpResultIds: string[] = [];
+
+  /** Results received while another import or review is active. They are reviewed one at a time. */
+  private queuedQbtcpResults: IReceivedResult[] = [];
+
+  /** Prevents two asynchronous import preparations from sharing one review modal. */
+  private qbtcpReviewInProgress: boolean = false;
+
+  /** Keeps queued QBTCP reviews behind the bookkeeping for the modal that just closed. */
+  private roomsBookkeepingInProgress: boolean = false;
 
   constructor() {
     this.dataChangedReactCallback = () => {};
@@ -127,6 +154,8 @@ export class TournamentManager {
     this.poolAssignmentModalManager = new PoolAssignmentModalManager();
     this.matchImportResultsManager = new MatchImportResultsManager();
     this.sqbsExportModalManager = new SqbsExportModalManager();
+    this.roomsManager = new RoomsManager();
+    this.roomsManager.getTournament = () => this.tournament;
     this.inAppStatReportGenerated = new Date();
 
     this.requestAppVersion();
@@ -177,6 +206,12 @@ export class TournamentManager {
     window.electron.ipcRenderer.on(IpcMainToRend.ImportQbjGamesMainLaunch, (fileAry) => {
       this.importMatchesFromQbj(fileAry as IMatchImportFileRequest[]);
     });
+    window.electron.ipcRenderer.on(IpcMainToRend.QbtcpResultReceived, (result) => {
+      this.handleQbtcpResultReceived(result as IReceivedResult);
+    });
+    window.electron.ipcRenderer.on(IpcMainToRend.QbtcpStateChanged, () => {
+      this.roomsManager.refresh();
+    });
     window.electron.ipcRenderer.on(IpcMainToRend.MakeToast, (message) => {
       this.makeToast(message as string);
     });
@@ -212,12 +247,31 @@ export class TournamentManager {
     window.electron.ipcRenderer.sendMessage(IpcBidirectional.LoadBackup);
   }
 
-  //eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this
   protected checkForNewVersion() {
     window.electron.ipcRenderer.sendMessage(IpcBidirectional.CheckForNewVersion);
   }
 
-  private checkForUnsavedData(action: FileSwitchActions) {
+  /**
+   * Decide whether we can switch away from the current file, and let the user save first if not.
+   *
+   * The Rooms check comes before the unsaved-data check, and refuses outright rather than offering a
+   * choice: unsaved data can be saved, but a live game in a room cannot be moved to a different
+   * tournament, and continuing would leave a scoresheet writing into a session this application no
+   * longer has. Closing the app is deliberately exempt - the results are already durable on disk, and
+   * refusing to let somebody quit would be worse than the risk it avoids.
+   */
+  private async checkForUnsavedData(action: FileSwitchActions) {
+    if (action !== FileSwitchActions.CloseApp && (await this.roomsManager.hasActiveWork())) {
+      this.openGenericModal(
+        'Rooms in progress',
+        'A room is still scoring a game, or has sent a result that nobody has reviewed yet. ' +
+          'Finish reviewing those results on the Rooms page before starting or opening a different tournament. ' +
+          'The current tournament has not been changed.',
+      );
+      return;
+    }
+
     if (!this.unsavedData) {
       window.electron.ipcRenderer.sendMessage(IpcRendToMain.ContinueWithAction, action);
       return;
@@ -235,10 +289,10 @@ export class TournamentManager {
   private newTournament() {
     this.tournament = new Tournament();
     this.tournament.appVersion = this.appVersion;
+    this.unsavedData = false;
     this.modalManagersSetTournament();
     this.setFilePath(null);
     this.displayName = '';
-    this.unsavedData = false;
 
     this.setWindowTitle();
     this.dataChangedReactCallback();
@@ -310,9 +364,9 @@ export class TournamentManager {
 
     this.setFilePath(filePath as string);
     this.tournament = loadedTournament;
+    this.unsavedData = false;
     this.modalManagersSetTournament();
     this.displayName = this.tournament.name || '';
-    this.unsavedData = false;
     this.setWindowTitle();
     this.dataChangedReactCallback();
   }
@@ -533,7 +587,9 @@ export class TournamentManager {
       IpcBidirectional.ImportQbjGamesRendererLaunch,
     )) as IMatchImportFileRequest[];
 
-    this.importMatchesFromQbj(files, round);
+    // Awaited: the import is asynchronous now that it consults the Rooms adapter, and a caller that
+    // did not wait would return before the review dialog existed.
+    await this.importMatchesFromQbj(files, round);
   }
 
   /**
@@ -541,40 +597,86 @@ export class TournamentManager {
    * @param fileAry The files we're trying to parse
    * @param round Which round the matches should go into. If not passed, use the files to determine the correct rounds.
    */
-  private importMatchesFromQbj(fileAry: IMatchImportFileRequest[], round?: Round) {
+  private async importMatchesFromQbj(fileAry: IMatchImportFileRequest[], round?: Round) {
     if (fileAry.length === 0) return;
 
     const phase = round ? this.tournament.findPhaseByRound(round) : undefined;
 
-    let results: MatchImportResult[] = [];
+    const results: MatchImportResult[] = [];
     for (const oneFile of fileAry) {
       const { filePath, fileContents } = oneFile;
       const objFromFile = this.parseJSON(fileContents);
-      if (!objFromFile) return;
+      if (!objFromFile) {
+        const badFile = new MatchImportResult(filePath);
+        badFile.markFatal('This file does not contain valid JSON.');
+        results.push(badFile);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      // Identity is read from the raw document, before case conversion, and from a plain parse rather
+      // than the date-aware one. The QBTCP path fingerprints a plain parse of the same bytes, so both
+      // routes compute the same value for the same game by construction.
+      // eslint-disable-next-line no-await-in-loop
+      const comparison = await classifyIncomingResult(fileContents);
 
       snakeCaseToCamelCase(objFromFile);
 
+      const fileResults: MatchImportResult[] = [];
       if ((objFromFile as IQbjWholeFile).objects) {
-        results = results.concat(this.importMatchesFromWholeQbj(objFromFile as IQbjWholeFile, filePath, phase, round));
+        fileResults.push(...this.importMatchesFromWholeQbj(objFromFile as IQbjWholeFile, filePath, phase, round));
       } else {
         const oneResult: MatchImportResult = new MatchImportResult(filePath);
-        results.push(oneResult);
+        fileResults.push(oneResult);
         const roundToUse = round ?? this.tournament.getRoundObjByNumber((objFromFile as IModaqMatch)._round);
         if (!roundToUse) {
           oneResult.markFatal("Couldn't determine a round for the game in this file");
-          continue;
+        } else {
+          const phaseToUse = phase ?? this.tournament.findPhaseByRound(roundToUse);
+          // A missing phase isn't plausible and there's no way to explain it to a user, so the match
+          // is left with its default fatal status rather than being described.
+          if (phaseToUse) this.importSingleMatchObj(objFromFile as IQbjMatch, phaseToUse, roundToUse, oneResult);
         }
-        const phaseToUse = phase ?? this.tournament.findPhaseByRound(roundToUse);
-        if (!phaseToUse) {
-          continue; // just ignore this match; this isn't plausible and I don't know how I would explain it to a user
-        }
-        this.importSingleMatchObj(objFromFile as IQbjMatch, phaseToUse, roundToUse, oneResult);
       }
+
+      this.annotateAlreadyRecorded(fileResults, comparison, fileContents);
+      results.push(...fileResults);
     }
 
     MatchImportResult.validateImportSetForTeamDups(results);
     this.tournament.setMatchIdCounter();
     this.openMatchImportModal(results, round);
+  }
+
+  /**
+   * Mark an import that duplicates or contradicts a result already on record.
+   *
+   * A duplicate is refused outright, because importing it would create a second match for one game.
+   * A conflict is surfaced and left for a person: two disagreeing results for the same game are never
+   * resolved automatically, and neither copy is discarded.
+   *
+   * Anything genuinely new is remembered so that a later automatic retry of the same game is
+   * recognised, which is the "network failed, control imported the file, the room reconnected" case.
+   */
+  private annotateAlreadyRecorded(
+    fileResults: MatchImportResult[],
+    comparison: ResultComparison | undefined,
+    fileContents: string,
+  ) {
+    if (!comparison || comparison.kind === 'new') {
+      if (comparison) this.pendingFileResultsToRecord.push(fileContents);
+      return;
+    }
+    for (const result of fileResults) {
+      if (comparison.kind === 'duplicate') {
+        result.markFatal('This result is already recorded in this tournament. No second game will be added.');
+      } else {
+        result.proceedWithImport = false;
+        result.markWarning(
+          'A different result is already recorded for this game. Both copies have been kept; review them before importing.',
+        );
+      }
+    }
   }
 
   /**
@@ -821,6 +923,12 @@ export class TournamentManager {
   modalManagersSetTournament() {
     this.teamModalManager.tournament = this.tournament;
     this.matchModalManager.tournament = this.tournament;
+    this.tournament.onTournamentIdCreated = () => this.markFileDirty();
+    // Point the Rooms adapter at whatever tournament is now open. Every path that replaces the
+    // tournament comes through here, so this is the one place that has to know.
+    this.roomsManager.bind(this.tournament).catch((error) => {
+      this.makeToast(`Rooms adapter could not bind to this tournament: ${(error as Error).message}`, 'error');
+    });
   }
 
   /** Keep track of which view the user is on, so that they can leave the Teams page, then
@@ -1400,6 +1508,113 @@ export class TournamentManager {
   closeMatchImportModal(shouldSave: boolean) {
     this.matchImportResultsManager.closeModal(shouldSave);
     this.onDataChanged(!shouldSave);
+    this.finishRoomsBookkeeping(shouldSave);
+  }
+
+  /**
+   * Settle the Rooms adapter's view of an import the director has just committed or cancelled.
+   *
+   * Runs after the matches are already in the tournament, and deliberately in this order:
+   *
+   *   1. Record the newly imported documents, so a later automatic retry is a duplicate.
+   *   2. Mark the QBTCP results resolved, so they stop being offered for review.
+   *   3. Force a backup immediately.
+   *
+   * Step 3 is the one that matters most. Upstream YellowFruit backs up on a timer, and a game accepted
+   * a minute before a crash would otherwise be gone while the room that sent it had been told
+   * "accepted". Marking the file dirty is not enough on its own, because dirty only means the next
+   * save will include it.
+   */
+  private async finishRoomsBookkeeping(shouldSave: boolean) {
+    this.roomsBookkeepingInProgress = true;
+    const documents = this.pendingFileResultsToRecord;
+    const resultIds = this.pendingQbtcpResultIds;
+    this.pendingFileResultsToRecord = [];
+    this.pendingQbtcpResultIds = [];
+
+    try {
+      if (!shouldSave) {
+        // Nothing was imported, so nothing is recorded and the results stay available for review.
+        return;
+      }
+
+      for (const contents of documents) {
+        try {
+          const document = JSON.parse(contents);
+          // eslint-disable-next-line no-await-in-loop
+          const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+            kind: 'recordFileResult',
+            document,
+          })) as QbtcpCommandResult | undefined;
+          if (!reply?.ok) {
+            this.makeToast(`Rooms: could not record imported result: ${reply?.error ?? 'no reply received'}`, 'error');
+          }
+        } catch {
+          // The adapter is optional; a failure here cannot be allowed to undo a completed import.
+        }
+      }
+
+      for (const resultId of resultIds) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+            kind: 'resolveResult',
+            resultId,
+            status: 'accepted',
+          })) as QbtcpCommandResult | undefined;
+          if (!reply?.ok) {
+            this.makeToast(
+              `Rooms: could not resolve result ${resultId}: ${reply?.error ?? 'no reply received'}`,
+              'error',
+            );
+          }
+        } catch {
+          // Same: the match is already in the tournament, which is the part that matters.
+        }
+      }
+
+      if (documents.length > 0 || resultIds.length > 0) {
+        this.saveBackup();
+        this.roomsManager.refresh();
+      }
+    } finally {
+      this.roomsBookkeepingInProgress = false;
+      this.startNextQbtcpReview().catch(() => undefined);
+    }
+  }
+
+  /**
+   * A QBTCP final arrived and is already durably stored by the main process.
+   *
+   * It goes through the identical importer a file goes through - same parser, same round and team
+   * resolution, same validation, same review dialog. A result off the network gets no shortcut around
+   * YellowFruit's checks, because "it came from the server" is not evidence that the teams in it
+   * match this tournament's rosters.
+   */
+  handleQbtcpResultReceived(result: IReceivedResult) {
+    this.queuedQbtcpResults.push(result);
+    this.roomsManager.refresh();
+    this.startNextQbtcpReview().catch(() => undefined);
+  }
+
+  private async startNextQbtcpReview(): Promise<void> {
+    if (this.matchImportResultsManager.modalIsOpen || this.qbtcpReviewInProgress || this.roomsBookkeepingInProgress)
+      return;
+    const next = this.queuedQbtcpResults.shift();
+    if (!next) return;
+
+    this.qbtcpReviewInProgress = true;
+    this.pendingQbtcpResultIds.push(next.id);
+    const label = `${next.roundNumber ? `Round ${next.roundNumber}` : 'Room result'} (QBSheet)`;
+    try {
+      await this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(next.document) }]);
+    } catch (error) {
+      this.pendingQbtcpResultIds = this.pendingQbtcpResultIds.filter((id) => id !== next.id);
+      this.makeToast(`Rooms: could not review result: ${(error as Error).message}`, 'error');
+    } finally {
+      this.qbtcpReviewInProgress = false;
+      if (!this.matchImportResultsManager.modalIsOpen) this.startNextQbtcpReview().catch(() => undefined);
+    }
   }
 
   openPhaseModal(phase: Phase) {
@@ -1619,4 +1834,31 @@ class NullTournamentManager extends TournamentManager {
 /** React context that elements can use to access the TournamentManager and its data without
  * having to thread data and data-changing functions up and down the react tree
  */
+/**
+ * Ask the Rooms adapter whether this document is already on record.
+ *
+ * Returns undefined when the adapter has nothing to say - no tournament bound, the document holds
+ * more than one game, or the command failed. An unavailable adapter must never block a manual
+ * import: file workflows have to keep working whether or not QBTCP is in use.
+ */
+async function classifyIncomingResult(fileContents: string): Promise<ResultComparison | undefined> {
+  let document: unknown;
+  try {
+    document = JSON.parse(fileContents);
+  } catch {
+    return undefined;
+  }
+  if (!document || typeof document !== 'object') return undefined;
+  try {
+    const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+      kind: 'classifyResult',
+      document,
+    })) as QbtcpCommandResult;
+    if (reply?.ok && 'comparison' in reply) return reply.comparison;
+  } catch {
+    // The adapter is optional. Nothing about a manual import depends on it answering.
+  }
+  return undefined;
+}
+
 export const TournamentContext = createContext<TournamentManager>(new NullTournamentManager());

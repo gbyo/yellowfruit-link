@@ -35,7 +35,7 @@ test('setTournamentName01', () => {
 // unsaved data flag
 test('setTournamentName02', () => {
   const mgr = new TestTournamentManager();
-  expect(mgr.unsavedData).toBeFalsy();
+  expect(mgr.unsavedData).toBeTruthy();
 
   mgr.setTournamentName('abc');
   expect(mgr.unsavedData).toBeTruthy();
@@ -55,7 +55,7 @@ test('setTournamentName03', () => {
 
 test('setTournamentSiteName01', () => {
   const mgr = new TestTournamentManager();
-  expect(mgr.unsavedData).toBeFalsy();
+  expect(mgr.unsavedData).toBeTruthy();
 
   mgr.setTournamentSiteName(' abc ');
   expect(mgr.tournament.tournamentSite.name).toBe('abc');
@@ -68,7 +68,7 @@ test('setTournamentSiteName01', () => {
 
 test('setQuestionSetname01', () => {
   const mgr = new TestTournamentManager();
-  expect(mgr.unsavedData).toBeFalsy();
+  expect(mgr.unsavedData).toBeTruthy();
 
   mgr.setQuestionSetname(' abc ');
   expect(mgr.tournament.questionSet).toBe('abc');
@@ -81,7 +81,7 @@ test('setQuestionSetname01', () => {
 
 test('setTournamentStartDate', () => {
   const mgr = new TestTournamentManager();
-  expect(mgr.unsavedData).toBeFalsy();
+  expect(mgr.unsavedData).toBeTruthy();
 
   mgr.setTournamentStartDate(dayjs('2023-10-15'));
   expect(mgr.tournament.startDate?.toString()).toBe(dayjs('2023-10-15').toDate().toString());

@@ -1,0 +1,76 @@
+/**
+ * The QBTCP v1 wire vocabulary, shared by the Electron main process and the renderer.
+ *
+ * This file is the only place the protocol's spelling lives. It deliberately contains no logic and
+ * no YellowFruit data model, so that both processes can agree on route names, header names and
+ * capability names without either one importing the other's world.
+ *
+ * The authority for everything here is the QBTCP specification (`docs/QBTCP.md` in gbyo/qbsheet),
+ * not this comment and not the older `/api/v1` surface that preceded it.
+ */
+
+/** The canonical protocol prefix. Version is a single integer in the path. */
+export const qbtcpPrefix = '/qbtcp/v1';
+
+/** The QBJ serialization version this server produces and accepts. */
+export const qbjVersion = '2.1.1';
+
+/** The media type a QBJ document travels as. Deliberately not `application/json`. */
+export const qbjMediaType = 'application/vnd.quizbowl.qbj+json';
+
+/**
+ * Credential headers. A credential travels only in a header - never in a URL, a log, the UI, or QBJ.
+ *
+ * The `x-yf-` prefix is historical and is treated as an opaque string, per the specification.
+ */
+export const roomTokenHeader = 'x-yf-room-token';
+export const sessionTokenHeader = 'x-yf-session-token';
+
+/** Informational headers. These never authorise an operation. */
+export const deviceIdHeader = 'x-yf-device-id';
+export const operatorNameHeader = 'x-yf-operator-name';
+
+/**
+ * What this server actually supports.
+ *
+ * Discovery MUST advertise only capabilities that work, because a client is forbidden from inferring
+ * support from the absence of an error. `help` and remote roster editing are absent because they are
+ * not implemented here - QBSheet requires only `pairing`, `assignment` and `result` for connected
+ * scoring, and treats the rest as enhancements.
+ */
+export const advertisedCapabilities = ['pairing', 'assignment', 'progress', 'result', 'recovery', 'presence'] as const;
+
+/** Assignment lifecycle state, as reported by `GET /qbtcp/v1/assignment/status`. */
+export type QbtcpAssignmentState = 'assigned' | 'none' | 'blocked' | 'held';
+
+/** Default port. Chosen high and unregistered to avoid colliding with dev servers. */
+export const defaultQbtcpPort = 40787;
+
+/** Valid explicit TCP listening ports. Port zero is reserved for OS-assigned ephemeral ports. */
+export const minQbtcpPort = 1;
+export const maxQbtcpPort = 65535;
+
+export function isValidQbtcpPort(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= minQbtcpPort && value <= maxQbtcpPort;
+}
+
+/**
+ * Origins allowed to make an authenticated cross-origin request.
+ *
+ * An exact allowlist, never a wildcard: a wildcard on a capability-token API would let any page on
+ * the internet drive a tournament from a scorekeeper's browser. The dev origins are included only
+ * in development builds because they are for QBSheet's local Vite server.
+ */
+const productionAllowedOrigins = ['https://qbsheet.com', 'https://www.qbsheet.com', 'https://gbyo.github.io'];
+
+export const defaultAllowedOrigins = [
+  ...productionAllowedOrigins,
+  ...(process.env.NODE_ENV === 'development' ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : []),
+];
+
+/** Hard limits on untrusted input. A body or URL beyond these is refused rather than parsed. */
+export const maxRequestBodyBytes = 4 * 1024 * 1024;
+export const maxUrlLength = 2048;
+
+/** Pairing attempt budget per client source, before `429`. */
+export const pairingRateLimit = { maxAttempts: 10, windowMs: 60_000 };

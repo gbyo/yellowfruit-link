@@ -41,6 +41,7 @@ import {
 import { IpcBidirectional, IpcRendToMain } from '../IPCChannels';
 import { FileSwitchActions, statReportProtocol } from '../SharedUtils';
 import { checkForNewVersions } from './UpdateChecker';
+import { registerQbtcpIpc, setQbtcpWindow, shutdownQbtcp } from './qbtcp/QbtcpIpc';
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -134,7 +135,10 @@ const createWindow = async () => {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    setQbtcpWindow(null);
   });
+
+  setQbtcpWindow(mainWindow);
 
   const menuBuilder = new MenuBuilder(mainWindow);
   menuBuilder.buildMenu();
@@ -156,6 +160,12 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  // Release the QBTCP port only when the application is actually quitting. Not awaited: quitting
+  // must not wait on a socket close, and a stop failure must not become an unhandled rejection.
+  shutdownQbtcp().catch(() => undefined);
 });
 
 app
@@ -186,6 +196,9 @@ app
     ipcMain.on(IpcBidirectional.GetAppVersion, (event) =>
       event.reply(IpcBidirectional.GetAppVersion, app.getVersion()),
     );
+    // The Rooms/QBTCP adapter. Registering the handler starts nothing: the server only listens once a
+    // director asks it to, so YellowFruit's behaviour is unchanged until then.
+    registerQbtcpIpc(mainWindow);
 
     protocol.handle(statReportProtocol, (request) => {
       const url = pathToFileURL(path.resolve(inAppStatReportDirectory, parseStatReportPath(request.url)));
