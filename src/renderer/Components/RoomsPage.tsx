@@ -282,6 +282,7 @@ function RoomRow(props: IRoomRowProps) {
               <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                 <IconButton
                   size="small"
+                  aria-label="Remove room"
                   disabled={assignmentLocked}
                   onClick={() =>
                     tournManager.genericModalManager.open(
