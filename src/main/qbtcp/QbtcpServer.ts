@@ -58,6 +58,7 @@ import {
 import {
   ResultComparison,
   compareToRecorded,
+  findResultMatch,
   readResultIdentity,
   stripCredentialKeys,
 } from '../../qbtcp/ResultFingerprint';
@@ -149,8 +150,9 @@ export default class QbtcpServer {
       (result) => result.status === 'needs-review' || result.status === 'conflict',
     );
     if (unresolvedResult) return true;
-    // A session that has been scored into but whose final has not arrived is live work.
-    return this.state.sessions.some((session) => !session.finalReceived && session.progressSequence > 0);
+    // Opening a session is enough to make the assignment live. Progress is best effort and may never
+    // arrive before a device goes offline, so it must not decide whether a game can be replaced.
+    return this.state.sessions.some((session) => !session.finalReceived);
   }
 
   async start(port: number): Promise<void> {
@@ -259,13 +261,16 @@ export default class QbtcpServer {
   /**
    * Remove a room, but only when nothing would be lost with it.
    *
-   * An assigned room, or one whose result nobody has dealt with, is refused rather than removed. The
-   * caller reports that to the director; silently discarding a game to satisfy a click is not a
-   * recoverable mistake.
+   * An assigned room, an unfinished session, or one whose result nobody has dealt with, is refused
+   * rather than removed. The caller reports that to the director; silently discarding a game to satisfy
+   * a click is not a recoverable mistake.
    */
   async removeRoom(roomId: string): Promise<{ removed: boolean; reason?: string }> {
     if (this.state.assignments.some((a) => a.roomId === roomId)) {
       return { removed: false, reason: 'Clear this room’s assignment before removing it.' };
+    }
+    if (this.state.sessions.some((session) => session.roomId === roomId && !session.finalReceived)) {
+      return { removed: false, reason: 'This room has an unfinished scoring session.' };
     }
     if (
       this.state.results.some((r) => r.roomId === roomId && (r.status === 'needs-review' || r.status === 'conflict'))
@@ -283,9 +288,18 @@ export default class QbtcpServer {
    * Give a room a game to score.
    *
    * The revision increases whenever a room's assignment is replaced, so that a result scored against
-   * a superseded pairing is detectable rather than indistinguishable from a current one.
+   * a superseded pairing is detectable rather than indistinguishable from a current one. An unfinished
+   * session locks the room even when no progress snapshot has arrived yet.
    */
-  async setAssignment(assignment: Omit<IRoomAssignment, 'id' | 'revision'>): Promise<IRoomAssignment> {
+  async setAssignment(
+    assignment: Omit<IRoomAssignment, 'id' | 'revision'>,
+  ): Promise<IRoomAssignment | { assigned: false; reason: string }> {
+    if (this.state.sessions.some((session) => session.roomId === assignment.roomId && !session.finalReceived)) {
+      return {
+        assigned: false,
+        reason: 'This room has an unfinished scoring session. Wait for its result before changing the assignment.',
+      };
+    }
     const previous = this.state.assignments.find((a) => a.roomId === assignment.roomId);
     const stored: IRoomAssignment = {
       ...assignment,
@@ -300,11 +314,10 @@ export default class QbtcpServer {
 
   async clearAssignment(roomId: string): Promise<{ cleared: boolean; reason?: string }> {
     const session = this.state.sessions.find((s) => s.roomId === roomId && !s.finalReceived);
-    if (session && session.progressSequence > 0) {
-      return { cleared: false, reason: 'This room has started scoring. Wait for its result or resolve it first.' };
+    if (session) {
+      return { cleared: false, reason: 'This room has an unfinished scoring session. Wait for its result first.' };
     }
     this.state.assignments = this.state.assignments.filter((a) => a.roomId !== roomId);
-    if (session) this.state.sessions = this.state.sessions.filter((s) => s.id !== session.id);
     await this.store.save(this.state);
     return { cleared: true };
   }
@@ -420,9 +433,9 @@ export default class QbtcpServer {
     }
 
     if (path === `${qbtcpPrefix}/rooms` && method === 'GET') {
-      const room = this.authorizeRoom(request, response);
-      if (!room) return;
-      // Identifiers and display names only. No token and no pairing code.
+      // This is pre-pairing discovery: QBSheet uses the names to show a room picker before it has a
+      // credential. The response contains no token or pairing code; the pairing endpoint still keeps
+      // its identical-failure oracle protection.
       sendJson(response, 200, {
         rooms: this.state.rooms.filter((entry) => entry.enabled).map((entry) => ({ id: entry.id, name: entry.name })),
       });
@@ -786,6 +799,25 @@ export default class QbtcpServer {
       return;
     }
 
+    if (!identity.matchId || identity.matchId !== session.matchId) {
+      sendJson(response, 409, { error: 'That result does not belong to this scoring session.' });
+      return;
+    }
+
+    const assignment = this.state.assignments.find(
+      (entry) => entry.roomId === session.roomId && entry.matchId === session.matchId,
+    );
+    if (!assignment) {
+      sendJson(response, 409, { error: 'That result no longer belongs to an assigned game.' });
+      return;
+    }
+
+    const assignmentError = validateResultAgainstAssignment(body, assignment);
+    if (assignmentError) {
+      sendJson(response, 409, { error: assignmentError });
+      return;
+    }
+
     const comparison = compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
       this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
@@ -798,7 +830,7 @@ export default class QbtcpServer {
       await this.store.save(this.state);
       sendJson(response, 200, {
         accepted: true,
-        match_id: identity.matchId ?? session.matchId,
+        match_id: identity.matchId,
         fingerprint: identity.fingerprint,
         duplicate: true,
       });
@@ -810,7 +842,7 @@ export default class QbtcpServer {
       id: makeOpaqueId('res-', 8),
       roomId: session.roomId,
       sessionId: session.id,
-      matchId: identity.matchId ?? session.matchId,
+      matchId: identity.matchId,
       fingerprint: identity.fingerprint,
       status: comparison.kind === 'conflict' ? 'conflict' : 'needs-review',
       // Kept exactly as it arrived, minus anything credential-shaped that should never have been in
@@ -919,6 +951,47 @@ function writerRefused(session: ISession, request: IncomingMessage, response: Se
     can_take_over: true,
   });
   return true;
+}
+
+/** Validate the identity and assignment metadata before a final can be compared or stored. */
+function validateResultAgainstAssignment(body: object, assignment: IRoomAssignment): string | undefined {
+  const match = findResultMatch(body);
+  if (!match) return 'That result contained no match this server could read.';
+
+  const rawTeams = match.match_teams ?? match.matchTeams;
+  if (!Array.isArray(rawTeams) || rawTeams.length !== 2) {
+    return 'That result does not contain the two teams assigned to this scoring session.';
+  }
+  const teamIds = rawTeams.map(teamIdFromMatchTeam);
+  if (
+    teamIds[0] !== assignment.leftTeamId ||
+    teamIds[1] !== assignment.rightTeamId ||
+    teamIds.some((teamId) => teamId === undefined)
+  ) {
+    return 'That result does not contain the two teams assigned to this scoring session.';
+  }
+
+  const extension = match._qbtcp;
+  if (extension !== undefined) {
+    if (!isPlainObject(extension)) return 'That result contains invalid QBTCP assignment metadata.';
+    const revision = extension.round_revision ?? extension.roundRevision;
+    if (
+      revision !== undefined &&
+      (typeof revision !== 'number' || !Number.isInteger(revision) || revision !== assignment.revision)
+    ) {
+      return 'That result belongs to an older assignment for this room.';
+    }
+  }
+  return undefined;
+}
+
+function teamIdFromMatchTeam(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const { team } = value;
+  if (!isPlainObject(team)) return undefined;
+  if (typeof team.$ref === 'string') return team.$ref;
+  if (typeof team.id === 'string') return team.id;
+  return undefined;
 }
 
 function sendJson(response: ServerResponse, status: number, body: object, contentType = 'application/json'): void {

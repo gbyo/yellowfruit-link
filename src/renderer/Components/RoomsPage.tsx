@@ -191,6 +191,7 @@ function RoomRow(props: IRoomRowProps) {
   const { room } = props;
   const tournManager = useContext(TournamentContext);
   const rooms = tournManager.roomsManager;
+  const assignmentLocked = !!room.session && !room.session.finalReceived;
   const [assignOpen, setAssignOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [newName, setNewName] = useState(room.name);
@@ -213,12 +214,26 @@ function RoomRow(props: IRoomRowProps) {
         </TableCell>
         <TableCell align="right">
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-            <Button size="small" onClick={() => setAssignOpen(true)}>
+            <Button
+              size="small"
+              disabled={assignmentLocked}
+              title={
+                assignmentLocked ? 'Finish the current scoring session before changing the assignment.' : undefined
+              }
+              onClick={() => setAssignOpen(true)}
+            >
               {room.assignment ? 'Change' : 'Assign'}
             </Button>
             {room.assignment && (
               <>
-                <Button size="small" onClick={() => rooms.clearAssignment(room.id)}>
+                <Button
+                  size="small"
+                  disabled={assignmentLocked}
+                  title={
+                    assignmentLocked ? 'Finish the current scoring session before clearing the assignment.' : undefined
+                  }
+                  onClick={() => rooms.clearAssignment(room.id)}
+                >
                   Clear
                 </Button>
                 <Tooltip title="Export this assignment as a .qbj file for offline scoring">

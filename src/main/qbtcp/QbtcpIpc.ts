@@ -156,8 +156,8 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
       if (!outcome.removed) return { ok: false, error: outcome.reason ?? 'That room could not be removed.' };
       return { ok: true, status: buildStatus(instance) };
     }
-    case 'setAssignment':
-      await instance.setAssignment({
+    case 'setAssignment': {
+      const outcome = await instance.setAssignment({
         roomId: command.roomId,
         roundNumber: command.roundNumber,
         leftTeamId: command.leftTeamId,
@@ -167,7 +167,9 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
         matchId: command.matchId,
         document: command.document,
       });
+      if ('assigned' in outcome && !outcome.assigned) return { ok: false, error: outcome.reason };
       return { ok: true, status: buildStatus(instance) };
+    }
     case 'clearAssignment': {
       const outcome = await instance.clearAssignment(command.roomId);
       if (!outcome.cleared) return { ok: false, error: outcome.reason ?? 'That assignment could not be cleared.' };

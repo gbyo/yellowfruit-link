@@ -188,7 +188,7 @@ export interface IQbtcpServerStatus {
   addresses: string[];
   /** Present when the last start attempt failed. Safe to display. */
   error?: string;
-  /** Whether any session has unresolved scored work, which blocks a tournament switch. */
+  /** Whether any session is unfinished or any result still needs review, which blocks a tournament switch. */
   hasActiveWork: boolean;
   rooms: IRoomView[];
 }
