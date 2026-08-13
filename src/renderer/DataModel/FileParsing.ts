@@ -165,6 +165,9 @@ export default class FileParser {
       this.tourn.finalRankingsReady = yfExtraData.finalRankingsReady || false;
       this.tourn.usingScheduleTemplate = yfExtraData.usingScheduleTemplate || false;
       this.tourn.appVersion = yfExtraData.YfVersion || '';
+      // Absent in files written before this field existed. Left empty here rather than generated, so
+      // that parsing stays free of side effects; the next save assigns one.
+      this.tourn.tournamentId = yfExtraData.tournamentId || '';
     } else {
       this.tourn.inferCarryoverStatus();
     }

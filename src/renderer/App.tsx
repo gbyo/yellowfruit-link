@@ -23,6 +23,7 @@ import TeamsPage from './Components/TeamsPage';
 import TeamEditDialog from './Components/TeamEditDialog';
 import GenericDialog from './Components/GenericDialog';
 import GamesPage from './Components/GamesPage';
+import RoomsPage from './Components/RoomsPage';
 import MatchEditDialog from './Components/MatchEditDialog';
 import StatReportPage from './Components/StatReportPage';
 import { ApplicationPages } from './Enums';
@@ -148,6 +149,8 @@ function ActivePage(props: IActivePageProps) {
       return <TeamsPage />;
     case ApplicationPages.Games:
       return <GamesPage />;
+    case ApplicationPages.Rooms:
+      return <RoomsPage />;
     case ApplicationPages.StatReport:
       return <StatReportPage />;
     default:
