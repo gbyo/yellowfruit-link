@@ -263,6 +263,8 @@ async function printPairingSheets(html: string): Promise<void> {
   try {
     await printWindow.loadURL(`${pairingSheetProtocol}://pairing-sheets/`);
     if (!printWindow.isDestroyed()) {
+      printWindow.show();
+      printWindow.focus();
       printWindow.webContents.print({ silent: false, printBackground: true });
     }
   } catch (error) {

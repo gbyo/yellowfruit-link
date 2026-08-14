@@ -620,7 +620,13 @@ export class TournamentManager {
       // eslint-disable-next-line no-await-in-loop
       const comparison = await classifyIncomingResult(fileContents);
 
-      snakeCaseToCamelCase(objFromFile);
+      const isBareCamelCaseMatch =
+        !Array.isArray((objFromFile as { objects?: unknown }).objects) &&
+        Array.isArray((objFromFile as { matchTeams?: unknown }).matchTeams) &&
+        !Array.isArray((objFromFile as { match_teams?: unknown }).match_teams);
+      // QBSheet's portable result is already a camelCase bare Match. Converting it as though it were
+      // a serialized QBJ document would overwrite matchTeams from the absent match_teams field.
+      if (!isBareCamelCaseMatch) snakeCaseToCamelCase(objFromFile);
 
       const fileResults: MatchImportResult[] = [];
       if ((objFromFile as IQbjWholeFile).objects) {
@@ -926,9 +932,12 @@ export class TournamentManager {
     this.tournament.onTournamentIdCreated = () => this.markFileDirty();
     // Point the Rooms adapter at whatever tournament is now open. Every path that replaces the
     // tournament comes through here, so this is the one place that has to know.
-    this.roomsManager.bind(this.tournament).catch((error) => {
-      this.makeToast(`Rooms adapter could not bind to this tournament: ${(error as Error).message}`, 'error');
-    });
+    this.roomsManager
+      .bind(this.tournament)
+      .then(() => this.queueUnresolvedQbtcpResults())
+      .catch((error) => {
+        this.makeToast(`Rooms adapter could not bind to this tournament: ${(error as Error).message}`, 'error');
+      });
   }
 
   /** Keep track of which view the user is on, so that they can leave the Teams page, then
@@ -1592,8 +1601,53 @@ export class TournamentManager {
    * match this tournament's rosters.
    */
   handleQbtcpResultReceived(result: IReceivedResult) {
-    this.queuedQbtcpResults.push(result);
     this.roomsManager.refresh();
+    this.queueQbtcpResult(result);
+  }
+
+  /** Reopen a durable result from the Rooms page after the original review was dismissed or missed. */
+  async reviewQbtcpResult(resultId: string): Promise<void> {
+    try {
+      const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+        kind: 'unresolvedResults',
+      })) as QbtcpCommandResult;
+      if (!reply?.ok || !('results' in reply)) {
+        const errorMessage = reply && 'error' in reply ? reply.error : 'no reply received';
+        this.makeToast(`Rooms: could not load the result for review: ${errorMessage}`, 'error');
+        return;
+      }
+      const result = reply.results.find((entry) => entry.id === resultId);
+      if (!result) {
+        this.makeToast('That result is no longer waiting for review.', 'info');
+        this.roomsManager.refresh();
+        return;
+      }
+      this.queueQbtcpResult(result);
+    } catch (error) {
+      this.makeToast(`Rooms: could not load the result for review: ${(error as Error).message}`, 'error');
+    }
+  }
+
+  private async queueUnresolvedQbtcpResults(): Promise<void> {
+    try {
+      const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+        kind: 'unresolvedResults',
+      })) as QbtcpCommandResult;
+      if (!reply?.ok || !('results' in reply)) return;
+      for (const result of reply.results) this.queueQbtcpResult(result);
+    } catch {
+      // The Rooms adapter is optional. A restart with no adapter response must not affect the editor.
+    }
+  }
+
+  private queueQbtcpResult(result: IReceivedResult): void {
+    if (
+      this.pendingQbtcpResultIds.includes(result.id) ||
+      this.queuedQbtcpResults.some((entry) => entry.id === result.id)
+    ) {
+      return;
+    }
+    this.queuedQbtcpResults.push(result);
     this.startNextQbtcpReview().catch(() => undefined);
   }
 
@@ -1606,8 +1660,9 @@ export class TournamentManager {
     this.qbtcpReviewInProgress = true;
     this.pendingQbtcpResultIds.push(next.id);
     const label = `${next.roundNumber ? `Round ${next.roundNumber}` : 'Room result'} (QBSheet)`;
+    const round = next.roundNumber !== undefined ? this.tournament.getRoundObjByNumber(next.roundNumber) : undefined;
     try {
-      await this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(next.document) }]);
+      await this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(next.document) }], round);
     } catch (error) {
       this.pendingQbtcpResultIds = this.pendingQbtcpResultIds.filter((id) => id !== next.id);
       this.makeToast(`Rooms: could not review result: ${(error as Error).message}`, 'error');

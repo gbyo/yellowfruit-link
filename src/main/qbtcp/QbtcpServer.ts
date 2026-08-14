@@ -60,6 +60,7 @@ import {
   compareToRecorded,
   findResultMatch,
   readResultIdentity,
+  readResultSourceMetadata,
   stripCredentialKeys,
 } from '../../qbtcp/ResultFingerprint';
 import { normalizeScoresheetUrl } from '../../qbtcp/PairingLaunch';
@@ -341,7 +342,15 @@ export default class QbtcpServer {
 
   /** Results the renderer has not yet turned into a decision. Used to re-offer them after a restart. */
   unresolvedResults(): IReceivedResult[] {
-    return this.state.results.filter((r) => r.status === 'needs-review' || r.status === 'conflict');
+    return this.state.results
+      .filter((r) => r.status === 'needs-review' || r.status === 'conflict')
+      .map((result) => {
+        if (result.roundNumber !== undefined) return result;
+        const assignment = this.state.assignments.find(
+          (entry) => entry.roomId === result.roomId && entry.matchId === result.matchId,
+        );
+        return assignment ? { ...result, roundNumber: assignment.roundNumber } : result;
+      });
   }
 
   /**
@@ -859,7 +868,12 @@ export default class QbtcpServer {
       document: stripCredentialKeys(body) as object,
       receivedAt: new Date().toISOString(),
       ...(comparison.kind === 'conflict' ? { conflictsWithResultId: comparison.existingId } : {}),
-      ...(identity.roundNumber !== undefined ? { roundNumber: identity.roundNumber } : {}),
+      // A bare QBSheet Match may not carry a round number. The current assignment is authoritative
+      // once the session and match identity have been checked, so keep enough context to reopen the
+      // review after a restart.
+      ...(identity.roundNumber !== undefined
+        ? { roundNumber: identity.roundNumber }
+        : { roundNumber: assignment.roundNumber }),
     };
     this.state.results.push(received);
     session.finalReceived = true;
@@ -963,7 +977,7 @@ function writerRefused(session: ISession, request: IncomingMessage, response: Se
 }
 
 /** Validate the identity and assignment metadata before a final can be compared or stored. */
-function validateResultAgainstAssignment(body: object, assignment: IRoomAssignment): string | undefined {
+export function validateResultAgainstAssignment(body: object, assignment: IRoomAssignment): string | undefined {
   const match = findResultMatch(body);
   if (!match) return 'That result contained no match this server could read.';
 
@@ -972,24 +986,37 @@ function validateResultAgainstAssignment(body: object, assignment: IRoomAssignme
     return 'That result does not contain the two teams assigned to this scoring session.';
   }
   const teamIds = rawTeams.map(teamIdFromMatchTeam);
-  if (
-    teamIds[0] !== assignment.leftTeamId ||
-    teamIds[1] !== assignment.rightTeamId ||
-    teamIds.some((teamId) => teamId === undefined)
-  ) {
+  const hasAllTeamIds = teamIds.every((teamId) => teamId !== undefined);
+  const hasNoTeamIds = teamIds.every((teamId) => teamId === undefined);
+  if (hasAllTeamIds) {
+    if (teamIds[0] !== assignment.leftTeamId || teamIds[1] !== assignment.rightTeamId) {
+      return 'That result does not contain the two teams assigned to this scoring session.';
+    }
+  } else if (hasNoTeamIds && match === body) {
+    const teamNames = rawTeams.map(teamNameFromMatchTeam);
+    if (
+      teamNames[0] !== assignment.leftTeamName ||
+      teamNames[1] !== assignment.rightTeamName ||
+      teamNames.some((teamName) => teamName === undefined)
+    ) {
+      return 'That result does not contain the two teams assigned to this scoring session.';
+    }
+  } else {
     return 'That result does not contain the two teams assigned to this scoring session.';
   }
 
   const extension = match._qbtcp;
+  let revision: unknown;
   if (extension !== undefined) {
     if (!isPlainObject(extension)) return 'That result contains invalid QBTCP assignment metadata.';
-    const revision = extension.round_revision ?? extension.roundRevision;
-    if (
-      revision !== undefined &&
-      (typeof revision !== 'number' || !Number.isInteger(revision) || revision !== assignment.revision)
-    ) {
-      return 'That result belongs to an older assignment for this room.';
-    }
+    revision = extension.round_revision ?? extension.roundRevision;
+  }
+  if (revision === undefined) revision = readResultSourceMetadata(match).roundRevision;
+  if (
+    revision !== undefined &&
+    (typeof revision !== 'number' || !Number.isInteger(revision) || revision !== assignment.revision)
+  ) {
+    return 'That result belongs to an older assignment for this room.';
   }
   return undefined;
 }
@@ -1001,6 +1028,13 @@ function teamIdFromMatchTeam(value: unknown): string | undefined {
   if (typeof team.$ref === 'string') return team.$ref;
   if (typeof team.id === 'string') return team.id;
   return undefined;
+}
+
+function teamNameFromMatchTeam(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const { team } = value;
+  if (!isPlainObject(team)) return undefined;
+  return typeof team.name === 'string' ? team.name : undefined;
 }
 
 function sendJson(response: ServerResponse, status: number, body: object, contentType = 'application/json'): void {
