@@ -107,6 +107,15 @@ export default class MenuBuilder {
         yftSaveAs(this.mainWindow);
       },
     },
+    {
+      label: '&Print',
+      accelerator: 'CmdOrCtrl+P',
+      click: (_menuItem, browserWindow) => {
+        const target = browserWindow instanceof BrowserWindow ? browserWindow : BrowserWindow.getFocusedWindow();
+        if (!target || target.isDestroyed()) return;
+        target.webContents.print({ silent: false, printBackground: true });
+      },
+    },
   ];
 
   readonly subMenuHelp: MenuItemConstructorOptions = {

@@ -117,6 +117,39 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Identity metadata QBSheet keeps on a bare Match instead of copying into standard QBJ fields. */
+export interface IResultSourceMetadata {
+  scheduledMatchId?: unknown;
+  tournamentId?: unknown;
+  roundRevision?: unknown;
+}
+
+/**
+ * Read source metadata with QBSheet taking precedence over the older scoresheet spelling.
+ *
+ * The values remain unknown here on purpose. Identity extraction only accepts valid strings and
+ * integers, while assignment validation must still be able to reject a malformed revision instead
+ * of treating it as if the field had not been sent.
+ */
+export function readResultSourceMetadata(match: Record<string, unknown>): IResultSourceMetadata {
+  const metadata: IResultSourceMetadata = {};
+  for (const sourceKey of ['_qbsheet_source', '_scoresheet_source']) {
+    const source = match[sourceKey];
+    if (!isPlainObject(source)) continue;
+
+    if (metadata.scheduledMatchId === undefined) {
+      metadata.scheduledMatchId = source.scheduledMatchId ?? source.scheduled_match_id;
+    }
+    if (metadata.tournamentId === undefined) {
+      metadata.tournamentId = source.tournamentId ?? source.tournament_id;
+    }
+    if (metadata.roundRevision === undefined) {
+      metadata.roundRevision = source.roundRevision ?? source.round_revision;
+    }
+  }
+  return metadata;
+}
+
 /**
  * The QBJ `Match` inside a result document, whatever envelope it arrived in.
  *
@@ -141,6 +174,7 @@ export interface IResultIdentity {
   matchId?: string;
   fingerprint: string;
   roundNumber?: number;
+  roundRevision?: number;
 }
 
 function positiveIntegerFrom(value: unknown): number | undefined {
@@ -189,13 +223,23 @@ export function readResultIdentity(document: unknown): IResultIdentity | null {
 
   const fingerprint = resultFingerprint(match);
   const identity: IResultIdentity = { fingerprint };
+  const source = readResultSourceMetadata(match);
 
   if (typeof match.id === 'string' && match.id !== '') identity.matchId = match.id;
+  if (!identity.matchId && typeof source.scheduledMatchId === 'string' && source.scheduledMatchId !== '') {
+    identity.matchId = source.scheduledMatchId;
+  }
 
   if (isPlainObject(document) && Array.isArray(document.objects)) {
     const tournament = document.objects.filter(isPlainObject).find((entry) => entry.type === 'Tournament');
     if (typeof tournament?.id === 'string' && tournament.id !== '') identity.tournamentId = tournament.id;
     if (identity.matchId) identity.roundNumber = roundNumberForMatch(document, identity.matchId);
+  }
+  if (!identity.tournamentId && typeof source.tournamentId === 'string' && source.tournamentId !== '') {
+    identity.tournamentId = source.tournamentId;
+  }
+  if (typeof source.roundRevision === 'number' && Number.isInteger(source.roundRevision)) {
+    identity.roundRevision = source.roundRevision;
   }
   // A bare Match from MODAQ and older workflows carries its round in `_round`.
   if (identity.roundNumber === undefined) {

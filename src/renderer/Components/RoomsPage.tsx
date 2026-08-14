@@ -353,28 +353,50 @@ function RoomRow(props: IRoomRowProps) {
  */
 function ConnectionCell(props: IRoomRowProps) {
   const { room } = props;
-  if (!room.paired) return <Chip size="small" variant="outlined" label="Not paired" />;
   if (room.session?.finalReceived) return <Chip size="small" color="success" label="Final received" />;
+  if (!room.paired) return <Chip size="small" variant="outlined" label="Not paired" />;
+  if (!room.connected) {
+    return <Chip size="small" variant="outlined" label={room.lastSeenAt ? 'Stale' : 'Waiting'} />;
+  }
   if (room.session?.scoring) {
     const label = room.session.tossupsRead !== undefined ? `Scoring · TU ${room.session.tossupsRead}` : 'Scoring';
     return <Chip size="small" color="primary" label={label} />;
   }
-  if (room.connected) return <Chip size="small" color="success" variant="outlined" label="Connected" />;
-  return <Chip size="small" variant="outlined" label={room.lastSeenAt ? 'Stale' : 'Waiting'} />;
+  return <Chip size="small" color="success" variant="outlined" label="Connected" />;
 }
 
 function ResultCell(props: IRoomRowProps) {
   const { room } = props;
-  if (!room.result) return <span>—</span>;
-  switch (room.result.status) {
+  const tournManager = useContext(TournamentContext);
+  const { result } = room;
+  if (!result) return <span>—</span>;
+  switch (result.status) {
     case 'needs-review':
-      return <Chip size="small" color="warning" label="Needs review" />;
+      return (
+        <Chip
+          size="small"
+          color="warning"
+          clickable
+          label="Needs review · Review"
+          title="Open result review"
+          onClick={() => tournManager.reviewQbtcpResult(result.id)}
+        />
+      );
     case 'accepted':
       return <Chip size="small" color="success" label="Accepted" />;
     case 'duplicate':
       return <Chip size="small" variant="outlined" label="Already recorded" />;
     case 'conflict':
-      return <Chip size="small" color="error" label="Conflict" />;
+      return (
+        <Chip
+          size="small"
+          color="error"
+          clickable
+          label="Conflict · Review"
+          title="Open result review"
+          onClick={() => tournManager.reviewQbtcpResult(result.id)}
+        />
+      );
     default:
       return <span>—</span>;
   }
