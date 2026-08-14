@@ -14,10 +14,22 @@ import { IpcBidirectional, IpcMainToRend } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
 import { IQbtcpServerStatus, IRoomView } from '../../qbtcp/QbtcpState';
 import { defaultQbtcpPort, isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { defaultScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import QbtcpServer, { lanAddresses } from './QbtcpServer';
 import QbtcpStore from './QbtcpStore';
 
 let server: QbtcpServer | undefined;
+
+/** The privileged scheme used only while a pairing-sheet print window is alive. */
+export const pairingSheetProtocol = 'yf-pairing-sheet';
+
+let pairingSheetHtml: string | undefined;
+let pairingSheetWindow: BrowserWindow | undefined;
+
+/** Read by the main-process protocol handler; the HTML is never written to a file. */
+export function getPairingSheetHtml(): string | undefined {
+  return pairingSheetHtml;
+}
 
 /** The window to notify. Held rather than looked up so a notification cannot pick the wrong window. */
 let targetWindow: BrowserWindow | null = null;
@@ -106,6 +118,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
   return {
     running: instance.running,
     ...(port !== undefined ? { port } : {}),
+    scoresheetUrl: state.scoresheetUrl ?? defaultScoresheetUrl,
     addresses: port !== undefined ? lanAddresses(port) : [],
     ...(instance.problem ? { error: instance.problem } : {}),
     hasActiveWork: instance.hasActiveWork(),
@@ -150,6 +163,9 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
       return { ok: true, status: buildStatus(instance) };
     case 'renameRoom':
       await instance.renameRoom(command.roomId, command.name);
+      return { ok: true, status: buildStatus(instance) };
+    case 'setScoresheetUrl':
+      await instance.setScoresheetUrl(command.url);
       return { ok: true, status: buildStatus(instance) };
     case 'removeRoom': {
       const outcome = await instance.removeRoom(command.roomId);
@@ -200,8 +216,59 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
       await fs.promises.writeFile(chosen.filePath, JSON.stringify(assignment.document), 'utf8');
       return { ok: true, exported: true };
     }
+    case 'printPairingSheets':
+      await printPairingSheets(command.html);
+      return { ok: true };
     default:
       return { ok: false, error: 'That Rooms command is not supported by this version.' };
+  }
+}
+
+/**
+ * Show the generated document in a fresh, locked-down window and invoke the native print dialog.
+ *
+ * The window deliberately remains open after `print` completes. A canceled print is recoverable with
+ * the normal keyboard shortcut, and closing the window is the point at which the in-memory document is
+ * discarded.
+ */
+async function printPairingSheets(html: string): Promise<void> {
+  if (typeof html !== 'string' || html.trim() === '') throw new Error('There are no pairing sheets to print.');
+  if (pairingSheetWindow && !pairingSheetWindow.isDestroyed()) {
+    pairingSheetWindow.focus();
+    throw new Error('A pairing-sheet print window is already open.');
+  }
+
+  const printWindow = new BrowserWindow({
+    show: true,
+    width: 900,
+    height: 700,
+    webPreferences: {
+      javascript: false,
+      nodeIntegration: false,
+      sandbox: true,
+      contextIsolation: true,
+    },
+  });
+  pairingSheetHtml = html;
+  pairingSheetWindow = printWindow;
+  const clearInMemoryDocument = () => {
+    if (pairingSheetWindow === printWindow) {
+      pairingSheetWindow = undefined;
+      pairingSheetHtml = undefined;
+    }
+  };
+  printWindow.on('closed', clearInMemoryDocument);
+  printWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  try {
+    await printWindow.loadURL(`${pairingSheetProtocol}://pairing-sheets/`);
+    if (!printWindow.isDestroyed()) {
+      printWindow.webContents.print({ silent: false, printBackground: true });
+    }
+  } catch (error) {
+    if (!printWindow.isDestroyed()) printWindow.close();
+    clearInMemoryDocument();
+    throw new Error(`The pairing sheets could not be prepared for printing: ${(error as Error).message}`);
   }
 }
 

@@ -19,6 +19,7 @@ import { IpcBidirectional } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
 import { IQbtcpServerStatus } from '../../qbtcp/QbtcpState';
 import { defaultQbtcpPort, isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { defaultScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import { makeOpaqueId } from '../../SharedUtils';
 import { assignmentFileName, buildAssignmentDocument } from '../DataModel/QbjAssignment';
 import { Round } from '../DataModel/Round';
@@ -26,7 +27,7 @@ import { Team } from '../DataModel/Team';
 import Tournament from '../DataModel/Tournament';
 
 function emptyStatus(): IQbtcpServerStatus {
-  return { running: false, addresses: [], hasActiveWork: false, rooms: [] };
+  return { running: false, addresses: [], hasActiveWork: false, rooms: [], scoresheetUrl: defaultScoresheetUrl };
 }
 
 function noop(): void {}
@@ -126,6 +127,16 @@ export default class RoomsManager {
 
   async renameRoom(roomId: string, name: string): Promise<void> {
     await this.send({ kind: 'renameRoom', roomId, name });
+  }
+
+  async setScoresheetUrl(url: string): Promise<boolean> {
+    const reply = await this.send({ kind: 'setScoresheetUrl', url });
+    return reply.ok;
+  }
+
+  async printPairingSheets(html: string): Promise<boolean> {
+    const reply = await this.send({ kind: 'printPairingSheets', html });
+    return reply.ok;
   }
 
   async removeRoom(roomId: string): Promise<void> {
