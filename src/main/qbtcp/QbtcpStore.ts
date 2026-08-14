@@ -206,6 +206,7 @@ function validateState(parsed: unknown, tournamentId: string): IQbtcpTournamentS
   // State bound to a different tournament must never be adopted by this one; the results inside it
   // belong to somebody else's games.
   if (parsed.tournamentId !== tournamentId) return null;
+  if (parsed.scoresheetUrl !== undefined && typeof parsed.scoresheetUrl !== 'string') return null;
 
   const rooms = arrayOfObjects(parsed.rooms).flatMap((room) => {
     if (
@@ -266,6 +267,7 @@ function validateState(parsed: unknown, tournamentId: string): IQbtcpTournamentS
   return {
     stateVersion: qbtcpStateVersion,
     tournamentId,
+    ...(typeof parsed.scoresheetUrl === 'string' ? { scoresheetUrl: parsed.scoresheetUrl } : {}),
     rooms,
     assignments,
     sessions,

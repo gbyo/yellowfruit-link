@@ -41,11 +41,21 @@ import {
 import { IpcBidirectional, IpcRendToMain } from '../IPCChannels';
 import { FileSwitchActions, statReportProtocol } from '../SharedUtils';
 import { checkForNewVersions } from './UpdateChecker';
-import { registerQbtcpIpc, setQbtcpWindow, shutdownQbtcp } from './qbtcp/QbtcpIpc';
+import {
+  getPairingSheetHtml,
+  pairingSheetProtocol,
+  registerQbtcpIpc,
+  setQbtcpWindow,
+  shutdownQbtcp,
+} from './qbtcp/QbtcpIpc';
 
 protocol.registerSchemesAsPrivileged([
   {
     scheme: statReportProtocol,
+    privileges: { standard: true, secure: true, supportFetchAPI: true },
+  },
+  {
+    scheme: pairingSheetProtocol,
     privileges: { standard: true, secure: true, supportFetchAPI: true },
   },
 ]);
@@ -203,6 +213,14 @@ app
     protocol.handle(statReportProtocol, (request) => {
       const url = pathToFileURL(path.resolve(inAppStatReportDirectory, parseStatReportPath(request.url)));
       return net.fetch(url.href);
+    });
+
+    protocol.handle(pairingSheetProtocol, () => {
+      const html = getPairingSheetHtml();
+      return new Response(html ?? '<!doctype html><title>Pairing sheets unavailable</title>', {
+        status: html ? 200 : 404,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
     });
 
     app.on('activate', () => {

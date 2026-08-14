@@ -35,6 +35,7 @@ import {
 import { Delete, Edit, FileDownload, PlayArrow, Refresh, Stop } from '@mui/icons-material';
 import { TournamentContext } from '../TournamentManager';
 import YfCard from './YfCard';
+import PairingSheetsDialog from './PairingSheetsDialog';
 import { IRoomView } from '../../qbtcp/QbtcpState';
 import { isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
@@ -43,6 +44,7 @@ function RoomsPage() {
   const tournManager = useContext(TournamentContext);
   const rooms = tournManager.roomsManager;
   const [, forceUpdate] = useState({});
+  const [pairingSheetsOpen, setPairingSheetsOpen] = useState(false);
 
   useEffect(() => {
     rooms.dataChangedReactCallback = () => forceUpdate({});
@@ -55,57 +57,68 @@ function RoomsPage() {
   const { status } = rooms;
 
   return (
-    <Grid container spacing={2}>
-      {rooms.lastError && (
+    <>
+      <Grid container spacing={2}>
+        {rooms.lastError && (
+          <Grid xs={12}>
+            <Alert severity="error">{rooms.lastError}</Alert>
+          </Grid>
+        )}
         <Grid xs={12}>
-          <Alert severity="error">{rooms.lastError}</Alert>
+          <ServerCard />
         </Grid>
-      )}
-      <Grid xs={12}>
-        <ServerCard />
+        <Grid xs={12}>
+          <YfCard
+            title="Rooms"
+            secondaryHeader={
+              <Stack direction="row" spacing={1}>
+                <Tooltip title="Refresh room status">
+                  <IconButton size="small" onClick={() => rooms.refresh()}>
+                    <Refresh fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={status.rooms.length === 0}
+                  onClick={() => setPairingSheetsOpen(true)}
+                >
+                  Print pairing sheets
+                </Button>
+                <Button size="small" variant="outlined" onClick={() => rooms.addRoom(nextRoomName(status.rooms))}>
+                  Add room
+                </Button>
+              </Stack>
+            }
+          >
+            {status.rooms.length === 0 ? (
+              <Typography variant="body2">
+                No rooms yet. Add one, then read its pairing code to the scorekeeper in that room.
+              </Typography>
+            ) : (
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Room</TableCell>
+                    <TableCell>Pairing code</TableCell>
+                    <TableCell>Connection</TableCell>
+                    <TableCell>Assignment</TableCell>
+                    <TableCell>Result</TableCell>
+                    <TableCell align="right">Actions</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {status.rooms.map((room) => (
+                    <RoomRow key={room.id} room={room} />
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </YfCard>
+        </Grid>
       </Grid>
-      <Grid xs={12}>
-        <YfCard
-          title="Rooms"
-          secondaryHeader={
-            <Stack direction="row" spacing={1}>
-              <Tooltip title="Refresh room status">
-                <IconButton size="small" onClick={() => rooms.refresh()}>
-                  <Refresh fontSize="small" />
-                </IconButton>
-              </Tooltip>
-              <Button size="small" variant="outlined" onClick={() => rooms.addRoom(nextRoomName(status.rooms))}>
-                Add room
-              </Button>
-            </Stack>
-          }
-        >
-          {status.rooms.length === 0 ? (
-            <Typography variant="body2">
-              No rooms yet. Add one, then read its pairing code to the scorekeeper in that room.
-            </Typography>
-          ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Room</TableCell>
-                  <TableCell>Pairing code</TableCell>
-                  <TableCell>Connection</TableCell>
-                  <TableCell>Assignment</TableCell>
-                  <TableCell>Result</TableCell>
-                  <TableCell align="right">Actions</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {status.rooms.map((room) => (
-                  <RoomRow key={room.id} room={room} />
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </YfCard>
-      </Grid>
-    </Grid>
+      <PairingSheetsDialog open={pairingSheetsOpen} onClose={() => setPairingSheetsOpen(false)} />
+    </>
   );
 }
 

@@ -21,6 +21,8 @@ export type QbtcpCommand =
   | { kind: 'addRoom'; name: string }
   | { kind: 'renameRoom'; roomId: string; name: string }
   | { kind: 'removeRoom'; roomId: string }
+  /** Save the scoresheet address for future pairing sheets. */
+  | { kind: 'setScoresheetUrl'; url: string }
   /**
    * Publish an assignment.
    *
@@ -62,7 +64,9 @@ export type QbtcpCommand =
    * out. The renderer does not rebuild the document for export, so the file and the network body are
    * identical by construction rather than because two builders were kept in step.
    */
-  | { kind: 'exportAssignment'; roomId: string; suggestedFileName: string };
+  | { kind: 'exportAssignment'; roomId: string; suggestedFileName: string }
+  /** Print an already-rendered pairing-sheet document without writing it to disk. */
+  | { kind: 'printPairingSheets'; html: string };
 
 export type QbtcpCommandResult =
   | { ok: true; status: IQbtcpServerStatus }

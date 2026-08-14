@@ -118,6 +118,8 @@ export interface IQbtcpTournamentState {
   stateVersion: number;
   /** The tournament this state belongs to. Guards against binding state to the wrong file. */
   tournamentId: string;
+  /** Optional self-hosted scoresheet address. Older state files intentionally omit it. */
+  scoresheetUrl?: string;
   rooms: IRoom[];
   assignments: IRoomAssignment[];
   sessions: ISession[];
@@ -184,6 +186,8 @@ export interface IRoomView {
 export interface IQbtcpServerStatus {
   running: boolean;
   port?: number;
+  /** The persisted scoresheet address, or the public default when it has not been chosen yet. */
+  scoresheetUrl: string;
   /** Usable LAN addresses a scorekeeper can type in. */
   addresses: string[];
   /** Present when the last start attempt failed. Safe to display. */

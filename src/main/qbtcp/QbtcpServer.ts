@@ -62,6 +62,7 @@ import {
   readResultIdentity,
   stripCredentialKeys,
 } from '../../qbtcp/ResultFingerprint';
+import { normalizeScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import { makeOpaqueId } from '../../SharedUtils';
 import QbtcpStore from './QbtcpStore';
 import {
@@ -255,6 +256,14 @@ export default class QbtcpServer {
     const room = this.state.rooms.find((entry) => entry.id === roomId);
     if (!room) return;
     room.name = name;
+    await this.store.save(this.state);
+  }
+
+  async setScoresheetUrl(url: string): Promise<void> {
+    const normalized = normalizeScoresheetUrl(url);
+    if (!normalized) throw new Error('The scoresheet address must be an HTTP or HTTPS URL.');
+    if (this.state.scoresheetUrl === normalized) return;
+    this.state.scoresheetUrl = normalized;
     await this.store.save(this.state);
   }
 
