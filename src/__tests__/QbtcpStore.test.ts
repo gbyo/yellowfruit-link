@@ -66,7 +66,7 @@ test('a damaged record is dropped, reported, and the file it came from is kept',
   expect(kept).toHaveLength(1);
 });
 
-test('a session written before per-device grants keeps the token its device is using', async () => {
+test('a session written before credential-bound writers keeps its existing writer token', async () => {
   const store = await newStore();
   await writeRawState(store, 'legacy-session', {
     ...emptyQbtcpState('legacy-session'),
@@ -89,6 +89,8 @@ test('a session written before per-device grants keeps the token its device is u
 
   expect(loaded.problem).toBeUndefined();
   expect(loaded.state.sessions[0].grants).toEqual([{ deviceId: 'chromebook-1', token: 'st-legacy' }]);
+  expect(loaded.state.sessions[0].writerGrantToken).toBe('st-legacy');
+  expect(loaded.state.sessions[0].writerDeviceId).toBe('chromebook-1');
 });
 
 test('a stored progress sequence the live protocol would refuse costs its session, not the file', async () => {
@@ -117,6 +119,37 @@ test('a room token that is not a string leaves the room unpaired rather than fal
 
   expect(loaded.state.rooms).toHaveLength(1);
   expect(loaded.state.rooms[0].roomToken).toBeUndefined();
+});
+
+test('a blank room token leaves the room unpaired rather than falsely paired', async () => {
+  const store = await newStore();
+  await writeRawState(store, 'blank-token', {
+    ...emptyQbtcpState('blank-token'),
+    rooms: [{ id: 'room-1', name: 'Room 1', pairingCode: '11112222', enabled: true, roomToken: '   ' }],
+  });
+
+  const loaded = await store.load('blank-token');
+
+  expect(loaded.state.rooms).toHaveLength(1);
+  expect(loaded.state.rooms[0].roomToken).toBeUndefined();
+  expect(loaded.problem).toContain('damaged');
+});
+
+test('invalid and future presence records are discarded on recovery', async () => {
+  const store = await newStore();
+  await writeRawState(store, 'presence-times', {
+    ...emptyQbtcpState('presence-times'),
+    presence: [
+      { roomId: 'room-1', lastSeenAt: 'not-a-date' },
+      { roomId: 'room-2', lastSeenAt: '2999-01-01T00:00:00.000Z' },
+      { roomId: 'room-3', lastSeenAt: '2026-01-01T00:00:00.000Z' },
+    ],
+  });
+
+  const loaded = await store.load('presence-times');
+
+  expect(loaded.state.presence).toEqual([{ roomId: 'room-3', lastSeenAt: '2026-01-01T00:00:00.000Z' }]);
+  expect(loaded.problem).toContain('damaged');
 });
 
 test('a legacy state without scoresheetUrl still loads unchanged', async () => {

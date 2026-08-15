@@ -179,13 +179,13 @@ export function findResultMatchList(document: unknown): Record<string, unknown>[
     // top-level objects. Those are the same games, and a file whose games are spelled that way is
     // still a file whose games must not be imported twice.
     for (const entry of objects) {
-      for (const phase of arrayOf(entry.phases)) {
-        for (const round of arrayOf(phase.rounds)) {
-          for (const match of arrayOf(round.matches)) {
-            if (typeof match.$ref === 'string' || seen.has(match)) continue;
-            seen.add(match);
-            matches.push(match);
-          }
+      const rounds =
+        entry.type === 'Round' ? [entry] : arrayOf(entry.phases).flatMap((phase) => arrayOf(phase.rounds));
+      for (const round of rounds) {
+        for (const match of arrayOf(round.matches)) {
+          if (typeof match.$ref === 'string' || seen.has(match)) continue;
+          seen.add(match);
+          matches.push(match);
         }
       }
     }

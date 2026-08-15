@@ -105,6 +105,39 @@ test('a second device is told it is not the writer and cannot write with what it
   expect(accepted.status).toBe(200);
 });
 
+test("claiming the writer's device id does not return its writable capability", async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const writer = await openSession(roomToken, matchId, 'chromebook-1');
+  expect(writer.body.writer).toBe(true);
+
+  const claimant = await openSession(roomToken, matchId, 'chromebook-1');
+  expect(claimant.body.writer).toBe(false);
+  expect(claimant.body.token).not.toBe(writer.body.token);
+
+  const refused = await call('PUT', `/sessions/${claimant.body.session_id}/progress`, {
+    headers: { [sessionTokenHeader]: claimant.body.token },
+    body: { sequence: 1, match: {} },
+  });
+  expect(refused.status).toBe(409);
+
+  const accepted = await call('PUT', `/sessions/${writer.body.session_id}/progress`, {
+    headers: { [sessionTokenHeader]: writer.body.token },
+    body: { sequence: 1, match: {} },
+  });
+  expect(accepted.status).toBe(200);
+});
+
+test('anonymous non-writer reconnects reuse one capability', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  await openSession(roomToken, matchId, 'chromebook-1');
+
+  const first = await openSession(roomToken, matchId);
+  const reopened = await openSession(roomToken, matchId);
+  expect(first.body.writer).toBe(false);
+  expect(reopened.body.writer).toBe(false);
+  expect(reopened.body.token).toBe(first.body.token);
+});
+
 test('a takeover that names no device is refused rather than leaving the lock unowned', async () => {
   const { roomToken, matchId } = await pairedRoomWithAssignment();
   const writer = await openSession(roomToken, matchId, 'chromebook-1');
@@ -136,6 +169,23 @@ test('a takeover that names no device is refused rather than leaving the lock un
     body: { sequence: 1, match: {} },
   });
   expect(nowRefused.status).toBe(409);
+});
+
+test('takeover removes another live grant for the claimant', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const writer = await openSession(roomToken, matchId, 'chromebook-1');
+  const claimant = await openSession(roomToken, matchId, 'chromebook-1');
+
+  const takenOver = await call('POST', `/sessions/${claimant.body.session_id}/writer`, {
+    headers: { [sessionTokenHeader]: claimant.body.token },
+    body: { take_over: true },
+  });
+  expect(takenOver.status).toBe(200);
+
+  const oldGrant = await call('GET', `/sessions/${writer.body.session_id}/recovery`, {
+    headers: { [sessionTokenHeader]: writer.body.token },
+  });
+  expect(oldGrant.status).toBe(401);
 });
 
 test('re-pairing a room revokes the session its previous device was writing to', async () => {

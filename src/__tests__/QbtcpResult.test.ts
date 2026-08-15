@@ -4,7 +4,7 @@ import path from 'path';
 import { expect, test } from 'vitest';
 import QbtcpServer, { validateResultAgainstAssignment } from '../main/qbtcp/QbtcpServer';
 import QbtcpStore from '../main/qbtcp/QbtcpStore';
-import { readResultIdentity, readResultSourceMetadata } from '../qbtcp/ResultFingerprint';
+import { findResultMatchList, readResultIdentity, readResultSourceMetadata } from '../qbtcp/ResultFingerprint';
 import { IRoomAssignment } from '../qbtcp/QbtcpState';
 import { buildAssignmentDocument } from '../renderer/DataModel/QbjAssignment';
 import { makeTestTournament, roundNumbered, teamNamed } from './QbtcpFixtures';
@@ -101,6 +101,20 @@ test('prefers standard QBJ identity and team IDs when they are present', () => {
 
   expect(readResultIdentity(result)).toMatchObject({ matchId: assignment.matchId });
   expect(validateResultAgainstAssignment(result, assignment)).toBeUndefined();
+});
+
+test('finds inline matches under top-level Round objects', () => {
+  const inline = {
+    type: 'Match',
+    id: 'Match_inline',
+    match_teams: [{ team: { $ref: 'Team_left' } }, { team: { $ref: 'Team_right' } }],
+  };
+  const document = {
+    version: '2.1.1',
+    objects: [{ type: 'Round', name: '4', matches: [inline, { $ref: 'Match_elsewhere' }] }],
+  };
+
+  expect(findResultMatchList(document)).toEqual([inline]);
 });
 
 test('a multi-game file is classified and recorded one game at a time', async () => {

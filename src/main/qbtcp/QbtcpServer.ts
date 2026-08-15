@@ -649,12 +649,13 @@ export default class QbtcpServer {
     // A fresh token per pairing: a device that pairs again invalidates the previous one, which is
     // how a room recovers from a token that leaked onto a projector.
     room.roomToken = `rt-${randomBytes(24).toString('hex')}`;
-    // The session capabilities go with it. Revoking the room token while leaving an open session's
-    // token alive would let the device whose pairing was deliberately revoked keep writing to the
-    // game it was removed from. The newly paired device reopens the session and is issued a fresh
-    // grant, so nothing is lost but the revoked device's access.
+    // The session capabilities and writer ownership go with it. Revoking the room token while
+    // leaving either behind would let the device whose pairing was deliberately revoked keep control.
     for (const session of this.state.sessions) {
-      if (session.roomId === room.id) session.grants = [];
+      if (session.roomId !== room.id) continue;
+      session.grants = [];
+      session.writerGrantToken = null;
+      session.writerDeviceId = null;
     }
     // The previous device's operator name and heartbeat describe somebody who is no longer this
     // room's scorekeeper, so the room reads as waiting until the new device is heard from.
@@ -687,9 +688,8 @@ export default class QbtcpServer {
   /**
    * Resolve the session *and the grant it was reached with*, or refuse.
    *
-   * The grant matters as much as the session. It names the device the capability was issued to, which
-   * is what lets a write be attributed without depending on an informational header the client is
-   * free to omit.
+   * The grant matters as much as the session. Its opaque token is the credential used for writer
+   * ownership; the device label attached to it is attribution, not proof supplied by a later caller.
    */
   private authorizeSession(
     sessionId: string,
@@ -764,13 +764,14 @@ export default class QbtcpServer {
 
     const existing = this.state.sessions.find((s) => s.roomId === room.id && s.matchId === matchId);
     if (existing) {
-      // Reopening never transfers the lock: an automatic transfer is exactly how two devices end up
-      // both believing they are authoritative.
-      const isWriter = existing.writerDeviceId === null || existing.writerDeviceId === (deviceId ?? null);
-      if (existing.writerDeviceId === null && deviceId) existing.writerDeviceId = deviceId;
-      // A capability of its own, so this device's later writes carry its identity even though the
-      // protocol's device header is informational and QBSheet does not send it on a write.
-      const grant = grantFor(existing, deviceId ?? null);
+      // A caller-supplied device id is attribution, not proof of ownership. Never reuse the writer's
+      // credential merely because a new caller repeats the same id; only explicit takeover transfers it.
+      const grant = grantFor(existing, deviceId ?? null, existing.writerGrantToken ?? undefined);
+      if (existing.writerGrantToken === null) {
+        existing.writerGrantToken = grant.token;
+        existing.writerDeviceId = deviceId ?? null;
+      }
+      const isWriter = grant.token === existing.writerGrantToken;
       await this.store.save(this.state);
       sendJson(response, 200, {
         session_id: existing.id,
@@ -789,6 +790,7 @@ export default class QbtcpServer {
       roomId: room.id,
       matchId,
       grants: [],
+      writerGrantToken: null,
       writerDeviceId: deviceId ?? null,
       progressSequence: 0,
       finalReceived: false,
@@ -796,6 +798,7 @@ export default class QbtcpServer {
       updatedAt: now,
     };
     const grant = grantFor(session, deviceId ?? null);
+    session.writerGrantToken = grant.token;
     this.state.sessions.push(session);
     await this.store.save(this.state);
     this.hooks.onStateChanged();
@@ -866,14 +869,16 @@ export default class QbtcpServer {
       sendJson(response, 400, { error: 'A change of writer has to say which device is taking over.' });
       return;
     }
-    session.writerDeviceId = claimant;
-    // The grant this request arrived on now belongs to the writer, so its later writes are
-    // attributable even when it never sends the device header again.
+    // A claimant may already have another non-writer capability. Keep only the credential this
+    // explicit takeover arrived on so one device cannot retain multiple live session tokens.
+    session.grants = session.grants.filter((entry) => entry === grant || entry.deviceId !== claimant);
     grant.deviceId = claimant;
+    session.writerGrantToken = grant.token;
+    session.writerDeviceId = claimant;
     session.updatedAt = new Date().toISOString();
     await this.store.save(this.state);
     this.hooks.onStateChanged();
-    // The token does not change on a transfer; only who may write with it does.
+    // The token does not change on a transfer; only which credential owns the writer role does.
     sendJson(response, 200, { session_id: session.id, token: grant.token, writer: true });
   }
 
@@ -891,7 +896,7 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (writerRefused(session, grant, request, response)) return;
+    if (writerRefused(session, grant, response)) return;
     if (session.finalReceived) {
       // The recovery state of a game this application has already accepted must not keep moving.
       // Whatever this snapshot says, it describes a game that is over.
@@ -964,7 +969,7 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (writerRefused(session, grant, request, response)) return;
+    if (writerRefused(session, grant, response)) return;
 
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
@@ -1118,9 +1123,9 @@ export default class QbtcpServer {
   }
 }
 
-/** The capability this session has already issued to a device, or a fresh one. */
-function grantFor(session: ISession, deviceId: string | null): ISessionGrant {
-  const existing = deviceId === null ? undefined : session.grants.find((entry) => entry.deviceId === deviceId);
+/** The capability this session has already issued to a non-writer identity, or a fresh one. */
+function grantFor(session: ISession, deviceId: string | null, excludedToken?: string): ISessionGrant {
+  const existing = session.grants.find((entry) => entry.deviceId === deviceId && entry.token !== excludedToken);
   if (existing) return existing;
   const grant: ISessionGrant = { deviceId, token: `st-${randomBytes(24).toString('hex')}` };
   session.grants.push(grant);
@@ -1128,32 +1133,15 @@ function grantFor(session: ISession, deviceId: string | null): ISessionGrant {
 }
 
 /**
- * Refuse a write from a device that does not hold the writer lock.
+ * Refuse a write from a capability that does not hold the writer lock.
  *
- * The authority is the grant the request arrived on, not the device header. The header is
- * informational and current QBSheet sends it only when opening a session, so a lock enforced against
- * it would be no lock at all - a second device told `writer: false` could simply omit the header and
- * write anyway. The capability cannot be omitted: it is what authorized the request in the first
- * place, and it was issued to exactly one device.
- *
- * A session whose writer is unidentified (`null`) still admits any holder. That is not a hole but the
- * only honest answer when no device on the session ever said who it was; there is nothing to
- * distinguish them by.
- *
- * `409` rather than `401` on purpose: the session token is perfectly valid, and a device without the
- * lock may read. Conflating them would send a room hunting for a pairing code to fix a problem that
- * a person standing next to the other device has to resolve.
+ * The authority is the opaque grant token the session recorded as writer. `device_id` remains useful
+ * attribution, but a caller can choose that text and therefore cannot use it as proof that it owns the
+ * writer's credential. `409` rather than `401` on purpose: a non-writer session token is perfectly
+ * valid and may still read or explicitly take over.
  */
-function writerRefused(
-  session: ISession,
-  grant: ISessionGrant,
-  request: IncomingMessage,
-  response: ServerResponse,
-): boolean {
-  if (session.writerDeviceId === null) return false;
-  const claimedDeviceId = headerValue(request, deviceIdHeader);
-  const holdsLock = grant.deviceId === session.writerDeviceId;
-  if (holdsLock && (claimedDeviceId === undefined || claimedDeviceId === session.writerDeviceId)) return false;
+function writerRefused(session: ISession, grant: ISessionGrant, response: ServerResponse): boolean {
+  if (grant.token === session.writerGrantToken) return false;
   sendJson(response, 409, {
     error: 'Another device is scoring this game.',
     writer_device: session.writerDeviceId,
