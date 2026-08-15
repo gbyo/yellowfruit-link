@@ -1,5 +1,9 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { expect, test } from 'vitest';
-import { validateResultAgainstAssignment } from '../main/qbtcp/QbtcpServer';
+import QbtcpServer, { validateResultAgainstAssignment } from '../main/qbtcp/QbtcpServer';
+import QbtcpStore from '../main/qbtcp/QbtcpStore';
 import { readResultIdentity, readResultSourceMetadata } from '../qbtcp/ResultFingerprint';
 import { IRoomAssignment } from '../qbtcp/QbtcpState';
 import { buildAssignmentDocument } from '../renderer/DataModel/QbjAssignment';
@@ -97,6 +101,81 @@ test('prefers standard QBJ identity and team IDs when they are present', () => {
 
   expect(readResultIdentity(result)).toMatchObject({ matchId: assignment.matchId });
   expect(validateResultAgainstAssignment(result, assignment)).toBeUndefined();
+});
+
+test('a multi-game file is classified and recorded one game at a time', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-multi-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('multi-game-tournament');
+
+    const game = (id: string, points: number) => ({
+      type: 'Match',
+      id,
+      tossups_read: 20,
+      match_teams: [
+        { team: { $ref: 'Team_left' }, points },
+        { team: { $ref: 'Team_right' }, points: 100 },
+      ],
+    });
+    const file = (ids: string[]) => ({
+      version: '2.1.1',
+      objects: [
+        { type: 'Tournament', id: 'multi-game-tournament', name: 'Spring Invitational' },
+        ...ids.map((id, index) => game(id, 300 + index * 10)),
+      ],
+    });
+
+    // The first game arrives on its own and goes on record.
+    await server.recordFileResult(file(['Match_1']));
+    expect(server.getState().results).toHaveLength(1);
+
+    // Now a file whose first game is that one and whose other two are new.
+    const comparisons = server.classifyResults(file(['Match_1', 'Match_2', 'Match_3']));
+    expect(comparisons.map((entry) => entry.kind)).toEqual(['duplicate', 'new', 'new']);
+
+    await server.recordFileResult(file(['Match_1', 'Match_2', 'Match_3']));
+    // Three games on record, not one - the games after the first are remembered too.
+    expect(server.getState().results.map((entry) => entry.matchId)).toEqual(['Match_1', 'Match_2', 'Match_3']);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a game from another tournament is not mistaken for this tournament's", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-foreign-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('this-tournament');
+
+    const bareGame = (tournamentId: string) => ({
+      type: 'Match',
+      // The kind of match id two tournaments running the same software both hand out.
+      id: 'Match_1000',
+      tossups_read: 20,
+      match_teams: [
+        { team: { $ref: 'Team_left' }, points: 300 },
+        { team: { $ref: 'Team_right' }, points: 100 },
+      ],
+      _qbsheet_source: { tournamentId },
+    });
+
+    await server.recordFileResult(bareGame('this-tournament'));
+    expect(server.getState().results).toHaveLength(1);
+
+    // Same match id, different tournament, different statistics: a different game entirely.
+    const foreign = { ...bareGame('some-other-tournament'), tossups_read: 24 };
+    expect(server.classifyResults(foreign)).toEqual([{ kind: 'new' }]);
+    await expect(server.recordFileResult(foreign)).rejects.toThrow('different tournament');
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('rejects a bare result whose source revision is stale or whose names are misassigned', () => {

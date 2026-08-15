@@ -29,6 +29,7 @@ import { createHash } from 'node:crypto';
 import { writeFileAtomically, IAtomicFileSystem } from './AtomicFile';
 import {
   IQbtcpTournamentState,
+  ISessionGrant,
   emptyQbtcpState,
   qbtcpStateVersion,
   ReceivedResultStatus,
@@ -84,12 +85,29 @@ export default class QbtcpStore {
   // eslint-disable-next-line class-methods-use-this
   private async preserveUnusableFile(filePath: string): Promise<void> {
     const parsed = path.parse(filePath);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const preservedPath = path.join(parsed.dir, `${parsed.name}.unusable-${timestamp}${parsed.ext || '.json'}`);
+    const preservedPath = path.join(parsed.dir, `${parsed.name}.unusable-${nowStamp()}${parsed.ext || '.json'}`);
     try {
       await fs.promises.rename(filePath, preservedPath);
     } catch {
       // Opening the tournament must still succeed if the file cannot be moved aside.
+    }
+  }
+
+  /**
+   * Keep a copy of a file whose usable part is still being adopted.
+   *
+   * Copied rather than moved: the salvaged state is in use, and the next save writes over the
+   * original. Without the copy, the records that could not be read would be gone for good the first
+   * time anything changed.
+   */
+  // eslint-disable-next-line class-methods-use-this
+  private async preserveDamagedFile(filePath: string): Promise<void> {
+    const parsed = path.parse(filePath);
+    const preservedPath = path.join(parsed.dir, `${parsed.name}.damaged-${nowStamp()}${parsed.ext || '.json'}`);
+    try {
+      await fs.promises.copyFile(filePath, preservedPath);
+    } catch {
+      // Opening the tournament must still succeed if the copy cannot be made.
     }
   }
 
@@ -145,6 +163,18 @@ export default class QbtcpStore {
       };
     }
 
+    let problem: string | undefined;
+    if (validated.discarded > 0) {
+      // The salvageable part is still adopted - refusing all of it would lose the rooms and results
+      // that are perfectly good. But a record that vanished is not a healthy load, and the next save
+      // will overwrite the file it vanished from, so a copy is kept and the director is told.
+      await this.preserveDamagedFile(stateFilePath);
+      problem =
+        `${validated.discarded} saved Rooms ${validated.discarded === 1 ? 'record was' : 'records were'} damaged ` +
+        'and could not be loaded. The rest of this tournament’s Rooms state was kept, and a copy of the ' +
+        'damaged file is in the app data folder.';
+    }
+
     if (stateFilePath !== currentPath) {
       try {
         await fs.promises.rename(stateFilePath, currentPath);
@@ -152,7 +182,7 @@ export default class QbtcpStore {
         // The validated state is still usable; a later load can retry the migration.
       }
     }
-    return { state: validated };
+    return { state: validated.state, ...(problem ? { problem } : {}) };
   }
 
   /**
@@ -189,8 +219,50 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function arrayOfObjects(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isPlainObject) : [];
+/** A timestamp safe to put in a file name. */
+function nowStamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+/** A copy of a record without one key. Used to drop a field that cannot be carried forward. */
+function without(record: Record<string, unknown>, key: string): Record<string, unknown> {
+  const copy = { ...record };
+  delete copy[key];
+  return copy;
+}
+
+function isNonNegativeInteger(value: unknown): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * The grants recorded for a session, migrating a file written before they existed.
+ *
+ * Older files hold one `sessionToken` shared by every device on the session. That token stays valid
+ * and is attributed to whichever device held the writer lock, which is the only device that could
+ * have been using it in a way that mattered.
+ */
+function sessionGrants(session: Record<string, unknown>, writerDeviceId: string | null): ISessionGrant[] | null {
+  if (Array.isArray(session.grants)) {
+    const grants = session.grants.filter(
+      (entry): entry is ISessionGrant =>
+        isPlainObject(entry) &&
+        typeof entry.token === 'string' &&
+        entry.token !== '' &&
+        (entry.deviceId === null || typeof entry.deviceId === 'string'),
+    );
+    return grants.length === session.grants.length ? grants : null;
+  }
+  if (typeof session.sessionToken === 'string' && session.sessionToken !== '') {
+    return [{ deviceId: writerDeviceId, token: session.sessionToken }];
+  }
+  return null;
+}
+
+interface IValidatedState {
+  state: IQbtcpTournamentState;
+  /** How many individual records had to be dropped. Zero means the file loaded whole. */
+  discarded: number;
 }
 
 /**
@@ -199,8 +271,13 @@ function arrayOfObjects(value: unknown): Record<string, unknown>[] {
  * Its own file, but still untrusted: it may have been written by a different build, hand-edited, or
  * left behind by a version that stored something else. A shape check here is cheaper than a crash
  * during a round. Unknown fields on a record are preserved, since a newer build may have added one.
+ *
+ * Individual bad records are dropped rather than taking the whole file with them - one unreadable
+ * room must not cost a director every other room. But the count is reported, because a session or a
+ * result quietly disappearing is exactly the kind of loss somebody needs to hear about while there
+ * is still a paper scoresheet in the building.
  */
-function validateState(parsed: unknown, tournamentId: string): IQbtcpTournamentState | null {
+function validateState(parsed: unknown, tournamentId: string): IValidatedState | null {
   if (!isPlainObject(parsed)) return null;
   if (parsed.stateVersion !== qbtcpStateVersion) return null;
   // State bound to a different tournament must never be adopted by this one; the results inside it
@@ -208,70 +285,111 @@ function validateState(parsed: unknown, tournamentId: string): IQbtcpTournamentS
   if (parsed.tournamentId !== tournamentId) return null;
   if (parsed.scoresheetUrl !== undefined && typeof parsed.scoresheetUrl !== 'string') return null;
 
-  const rooms = arrayOfObjects(parsed.rooms).flatMap((room) => {
+  let discarded = 0;
+  const records = (value: unknown): Record<string, unknown>[] => {
+    if (!Array.isArray(value)) return [];
+    const objects = value.filter(isPlainObject);
+    discarded += value.length - objects.length;
+    return objects;
+  };
+  const keep = <T>(kept: T[] | null): T[] => {
+    if (kept === null) {
+      discarded += 1;
+      return [];
+    }
+    return kept;
+  };
+
+  const rooms = records(parsed.rooms).flatMap((room) => {
     if (
       typeof room.id !== 'string' ||
       typeof room.name !== 'string' ||
       typeof room.pairingCode !== 'string' ||
       (room.enabled !== undefined && typeof room.enabled !== 'boolean')
     ) {
-      return [];
+      return keep(null);
+    }
+    // A token that is not a string can never equal the string a request carries, so a room holding
+    // one would read as paired on the Rooms page and refuse every device that tried to use it.
+    // Dropping the field alone says the truth - this room is not paired - without losing the room.
+    if (room.roomToken !== undefined && typeof room.roomToken !== 'string') {
+      discarded += 1;
+      return [{ ...without(room, 'roomToken'), enabled: room.enabled ?? true }];
     }
     return [{ ...room, enabled: room.enabled ?? true }];
   });
-  const assignments = arrayOfObjects(parsed.assignments).filter(
-    (a) =>
-      typeof a.id === 'string' &&
-      typeof a.roomId === 'string' &&
-      typeof a.matchId === 'string' &&
-      isPlainObject(a.document),
+  const assignments = records(parsed.assignments).flatMap((a) =>
+    typeof a.id === 'string' &&
+    typeof a.roomId === 'string' &&
+    typeof a.matchId === 'string' &&
+    isPlainObject(a.document)
+      ? [a]
+      : keep(null),
   );
-  const sessions = arrayOfObjects(parsed.sessions).flatMap((session) => {
+  const sessions = records(parsed.sessions).flatMap((session) => {
+    const writerDeviceId =
+      session.writerDeviceId === undefined || session.writerDeviceId === null ? null : session.writerDeviceId;
+    if (writerDeviceId !== null && typeof writerDeviceId !== 'string') return keep(null);
+    const grants = sessionGrants(session, writerDeviceId);
     if (
       typeof session.id !== 'string' ||
       typeof session.roomId !== 'string' ||
-      typeof session.sessionToken !== 'string' ||
-      (session.progressSequence !== undefined &&
-        (typeof session.progressSequence !== 'number' || !Number.isFinite(session.progressSequence))) ||
-      (session.finalReceived !== undefined && typeof session.finalReceived !== 'boolean') ||
-      (session.writerDeviceId !== undefined &&
-        session.writerDeviceId !== null &&
-        typeof session.writerDeviceId !== 'string')
+      // Without the game it belongs to, a session can neither be matched to an assignment nor have a
+      // result checked against it, but it would still lock its room as unfinished work.
+      typeof session.matchId !== 'string' ||
+      grants === null ||
+      // The live protocol accepts only whole, non-negative sequences. A stored 1.5 would silently
+      // classify the legitimate sequence 2 that follows it as stale.
+      (session.progressSequence !== undefined && !isNonNegativeInteger(session.progressSequence)) ||
+      (session.finalReceived !== undefined && typeof session.finalReceived !== 'boolean')
     ) {
-      return [];
+      return keep(null);
     }
     return [
       {
-        ...session,
+        // `sessionToken` is dropped: it has been migrated into a grant, and leaving it behind would
+        // keep a second copy of a live capability in the file.
+        ...without(session, 'sessionToken'),
+        grants,
         progressSequence: session.progressSequence ?? 0,
         finalReceived: session.finalReceived ?? false,
-        writerDeviceId: session.writerDeviceId ?? null,
+        writerDeviceId,
       },
     ];
   });
   const validStatuses = new Set<ReceivedResultStatus>(['needs-review', 'accepted', 'duplicate', 'conflict']);
-  const results = arrayOfObjects(parsed.results).flatMap((result) => {
+  const results = records(parsed.results).flatMap((result) => {
     if (
       typeof result.id !== 'string' ||
       typeof result.fingerprint !== 'string' ||
       !isPlainObject(result.document) ||
+      // The identity fields are what associate a result with the room and game it came from. An
+      // unresolved result missing them counts as work blocking the whole tournament while being
+      // impossible to place against any of it.
+      typeof result.roomId !== 'string' ||
+      typeof result.sessionId !== 'string' ||
+      typeof result.matchId !== 'string' ||
+      typeof result.receivedAt !== 'string' ||
       (result.status !== undefined &&
         (typeof result.status !== 'string' || !validStatuses.has(result.status as ReceivedResultStatus)))
     ) {
-      return [];
+      return keep(null);
     }
     return [{ ...result, status: (result.status as ReceivedResultStatus | undefined) ?? 'needs-review' }];
   });
-  const presence = arrayOfObjects(parsed.presence).filter((p) => typeof p.roomId === 'string');
+  const presence = records(parsed.presence).flatMap((p) => (typeof p.roomId === 'string' ? [p] : keep(null)));
 
   return {
-    stateVersion: qbtcpStateVersion,
-    tournamentId,
-    ...(typeof parsed.scoresheetUrl === 'string' ? { scoresheetUrl: parsed.scoresheetUrl } : {}),
-    rooms,
-    assignments,
-    sessions,
-    results,
-    presence,
-  } as unknown as IQbtcpTournamentState;
+    discarded,
+    state: {
+      stateVersion: qbtcpStateVersion,
+      tournamentId,
+      ...(typeof parsed.scoresheetUrl === 'string' ? { scoresheetUrl: parsed.scoresheetUrl } : {}),
+      rooms,
+      assignments,
+      sessions,
+      results,
+      presence,
+    } as unknown as IQbtcpTournamentState,
+  };
 }

@@ -61,10 +61,22 @@ export default class RoomsManager {
   /** Set by TournamentManager so this manager can read teams, rounds and scoring rules. */
   getTournament: () => Tournament = newEmptyTournament;
 
-  private async send(command: QbtcpCommand): Promise<QbtcpCommandResult> {
-    const requestId = ++this.nextRequestId;
-    this.inFlight += 1;
-    this.busy = true;
+  /**
+   * Run a command and fold its reply into the state the page reads.
+   *
+   * `background` is for the page's own status tick rather than for anything a director asked for. It
+   * neither marks the manager busy nor reports its failures: a poll that flipped `busy` every few
+   * seconds would blink every room's buttons out from under a hand on the way to one, and a poll that
+   * wrote `lastError` would replace the message explaining what a director's last click did.
+   */
+  private async send(command: QbtcpCommand, background = false): Promise<QbtcpCommandResult> {
+    // A background poll takes no sequence number. Taking one would make every command already in
+    // flight look superseded, and the reply a director is actually waiting on would be thrown away.
+    const requestId = background ? 0 : ++this.nextRequestId;
+    if (!background) {
+      this.inFlight += 1;
+      this.busy = true;
+    }
     let reply: QbtcpCommandResult = { ok: false, error: 'The Rooms adapter did not respond.' };
     try {
       this.dataChangedReactCallback();
@@ -74,9 +86,16 @@ export default class RoomsManager {
     } catch (error) {
       reply = { ok: false, error: (error as Error).message || 'The Rooms adapter did not respond.' };
     } finally {
-      this.inFlight -= 1;
-      this.busy = this.inFlight > 0;
-      if (requestId === this.nextRequestId) {
+      if (!background) {
+        this.inFlight -= 1;
+        this.busy = this.inFlight > 0;
+      }
+      if (background) {
+        // A poll only fills in the quiet moments. It never lands on top of a command's outcome, and
+        // a poll that failed says nothing at all - the next one is fifteen seconds away.
+        if (reply.ok && 'status' in reply && this.inFlight === 0) this.status = reply.status;
+      } else if (requestId === this.nextRequestId) {
+        // Only the newest command's reply may write state, so a slow reply cannot replace a newer one.
         if (reply.ok) {
           this.lastError = undefined;
           if ('status' in reply) this.status = reply.status;
@@ -105,6 +124,16 @@ export default class RoomsManager {
 
   async refresh(): Promise<void> {
     await this.send({ kind: 'status' });
+  }
+
+  /**
+   * Re-read status without disturbing anything the director is doing.
+   *
+   * Presence expires on a clock rather than on an event, so the Rooms page has to ask. That question
+   * is the page's, not the director's, and it must not look like a command in flight.
+   */
+  async pollStatus(): Promise<void> {
+    await this.send({ kind: 'status' }, true);
   }
 
   async startServer(): Promise<void> {
@@ -170,6 +199,11 @@ export default class RoomsManager {
     }
 
     const matchId = makeOpaqueId('Match_', 8);
+    // The server increments its own revision; this is the value published in the document for the
+    // assignment about to replace whatever the room had. It is sent along with the command so the
+    // server can refuse a command issued from a page that had already gone out of date, rather than
+    // storing a revision the document it is storing does not claim.
+    const roundRevision = (room.assignment?.revision ?? 0) + 1;
     const document = buildAssignmentDocument({
       tournament,
       phase,
@@ -179,9 +213,7 @@ export default class RoomsManager {
       matchId,
       roomName: room.name,
       roomId: room.id,
-      // The server increments its own revision; this is the value published in the document for the
-      // assignment about to replace whatever the room had.
-      roundRevision: (room.assignment?.revision ?? 0) + 1,
+      roundRevision,
     });
 
     await this.send({
@@ -194,6 +226,7 @@ export default class RoomsManager {
       rightTeamName: rightTeam.name,
       matchId,
       document,
+      roundRevision,
     });
   }
 

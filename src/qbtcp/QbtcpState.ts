@@ -10,9 +10,9 @@
  *
  * # Credentials live here and nowhere else
  *
- * `pairingCode`, `roomToken` and `sessionToken` are secrets. They are written to the QBTCP state
- * file in the app-data directory, and they must never reach a QBJ document, a log line, or the
- * renderer's view of a room. `IRoomView` below is the redacted shape the renderer is given.
+ * `pairingCode`, `roomToken` and every session grant's token are secrets. They are written to the
+ * QBTCP state file in the app-data directory, and they must never reach a QBJ document, a log line,
+ * or the renderer's view of a room. `IRoomView` below is the redacted shape the renderer is given.
  */
 
 /** A scoring position in the tournament. The unit that pairs and authenticates. */
@@ -51,13 +51,28 @@ export interface IRoomAssignment {
   rightTeamName: string;
 }
 
+/**
+ * A capability issued for one session, to one device.
+ *
+ * One token per device rather than one per session. A shared token cannot say which of two devices
+ * presented it, so writer ownership could only be enforced against an informational header that the
+ * client is not required to send. Binding the capability to the device it was issued to moves that
+ * identity into the credential, where it cannot be omitted.
+ */
+export interface ISessionGrant {
+  /** The device this capability was issued to. Null when the client did not identify itself. */
+  deviceId: string | null;
+  /** Capability token scoped to this session and this device. Secret. */
+  token: string;
+}
+
 /** The work of one scoresheet on one assigned game. */
 export interface ISession {
   id: string;
   roomId: string;
   matchId: string;
-  /** Capability token scoped to this one session. Secret. */
-  sessionToken: string;
+  /** Every capability issued for this session, one per device. Secret. */
+  grants: ISessionGrant[];
   /** The device that may write. Null means the next writer claims it. */
   writerDeviceId: string | null;
   /** Highest progress sequence accepted. A lower one is discarded silently. */

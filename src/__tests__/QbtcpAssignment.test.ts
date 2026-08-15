@@ -8,7 +8,7 @@
  */
 import { expect, test } from 'vitest';
 import { assignmentFileName, buildAssignmentDocument } from '../renderer/DataModel/QbjAssignment';
-import { makeTestTournament, objectsOfType, roundNumbered, teamNamed } from './QbtcpFixtures';
+import { makeTeam, makeTestTournament, objectsOfType, roundNumbered, teamNamed } from './QbtcpFixtures';
 
 function buildFixtureAssignment(matchId = 'Match_abc123') {
   const tournament = makeTestTournament();
@@ -149,6 +149,64 @@ test('every answer type says whether it awards a bonus', () => {
   expect(answerTypes.find((entry) => entry.value === 15)?.awards_bonus).toBe(true);
   expect(answerTypes.find((entry) => entry.value === 10)?.awards_bonus).toBe(true);
   expect(answerTypes.find((entry) => entry.value === -5)?.awards_bonus).toBe(false);
+});
+
+test('two teams from one school produce one Registration object, not two with the same id', () => {
+  const tournament = makeTestTournament();
+  const round = roundNumbered(tournament, 4);
+  const phase = tournament.findPhaseByRound(round);
+  if (!phase) throw new Error('fixture round has no phase');
+  // An A and a B squad from the same school, which is an ordinary game to schedule.
+  const registration = tournament.registrations[0];
+  const bTeam = makeTeam(`${registration.name} B`, ['Robin', 'Kit', 'Sasha', 'Frankie']);
+  registration.addTeam(bTeam);
+
+  const document = buildAssignmentDocument({
+    tournament,
+    phase,
+    round,
+    leftTeam: registration.teams[0],
+    rightTeam: bTeam,
+    matchId: 'Match_intramural',
+    roomName: 'Room 204',
+    roomId: 'room-204',
+    roundRevision: 1,
+  });
+
+  const registrations = objectsOfType(document, 'Registration');
+  // One object per registration. Two objects sharing an id would make every $ref to it ambiguous.
+  expect(registrations).toHaveLength(1);
+  expect(registrations[0].teams).toHaveLength(2);
+  const qbjTournament = objectsOfType(document, 'Tournament')[0];
+  expect(qbjTournament.registrations).toEqual([{ $ref: registrations[0].id }]);
+});
+
+test('a tournament without bonuses does not tell a scoresheet that answers award them', () => {
+  const tournament = makeTestTournament();
+  tournament.scoringRules.useBonuses = false;
+  const round = roundNumbered(tournament, 4);
+  const phase = tournament.findPhaseByRound(round);
+  if (!phase) throw new Error('fixture round has no phase');
+
+  const document = buildAssignmentDocument({
+    tournament,
+    phase,
+    round,
+    leftTeam: teamNamed(tournament, 'Ninety Six'),
+    rightTeam: teamNamed(tournament, 'Greenwood'),
+    matchId: 'Match_tossups_only',
+    roomName: 'Room 204',
+    roomId: 'room-204',
+    roundRevision: 1,
+  });
+
+  const rules = objectsOfType(document, 'ScoringRules')[0];
+  expect(rules.maximum_bonus_score).toBeUndefined();
+  const answerTypes = rules.answer_types as { value: number; awards_bonus?: boolean }[];
+  // Every type still states the field; none of them claims a bonus this format does not have.
+  for (const answerType of answerTypes) {
+    expect(answerType.awards_bonus).toBe(false);
+  }
 });
 
 test('the document names no rule set by name in a way that invites branching', () => {

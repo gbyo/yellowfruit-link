@@ -1,6 +1,6 @@
+import { ResultComparison } from '../../qbtcp/ResultFingerprint';
 import { Match } from './Match';
 import { Phase } from './Phase';
-import { Pool } from './Pool';
 import { Round } from './Round';
 import { Team } from './Team';
 
@@ -29,6 +29,18 @@ class MatchImportResult {
 
   /** Whether the user wants to continue importing this match */
   proceedWithImport: boolean = false;
+
+  /**
+   * The QBJ Match this result came from, exactly as it was parsed and before any case conversion.
+   *
+   * Kept so each game in a multi-game file can be identified and remembered on its own. The bytes
+   * matter: a converted match hashes differently from the one a room sent, and the two routes have
+   * to agree on what "the same game" means.
+   */
+  sourceMatch?: object;
+
+  /** How this one game stands against what the Rooms adapter already has on record. */
+  comparison?: ResultComparison;
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -85,7 +97,7 @@ class MatchImportResult {
    */
   static validateImportSetForTeamDups(results: MatchImportResult[]) {
     const sortedResults = results.slice().sort((a, b) => (a.round?.number ?? -1) - (b.round?.number ?? -1));
-    let curRound: Round | undefined = undefined;
+    let curRound: Round | undefined;
     let teamsInRound: Team[] = [];
     for (const rslt of sortedResults) {
       const { match, round } = rslt;

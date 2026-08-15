@@ -74,3 +74,12 @@ export const maxUrlLength = 2048;
 
 /** Pairing attempt budget per client source, before `429`. */
 export const pairingRateLimit = { maxAttempts: 10, windowMs: 60_000 };
+
+/**
+ * How long a heartbeat means a room is still there.
+ *
+ * Shared, because a room that the server considers present and the Rooms page considers stale would
+ * be two different answers to one question. Nothing expires a session when it lapses - presence is
+ * advisory - but the moment it lapses is the moment the page has to stop claiming a connection.
+ */
+export const presenceFreshMs = 45_000;
