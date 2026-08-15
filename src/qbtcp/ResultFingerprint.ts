@@ -158,14 +158,46 @@ export function readResultSourceMetadata(match: Record<string, unknown>): IResul
  * cannot make the same game hash differently.
  */
 export function findResultMatch(document: unknown): Record<string, unknown> | null {
-  if (!isPlainObject(document)) return null;
+  return findResultMatchList(document)[0] ?? null;
+}
+
+/**
+ * Every QBJ `Match` in a result document, in document order.
+ *
+ * A file can hold a whole day of games. Reading only the first one is right for a QBTCP session,
+ * which carries exactly one game, and wrong for the manual import path, where one answer applied to
+ * ten games says nine wrong things.
+ */
+export function findResultMatchList(document: unknown): Record<string, unknown>[] {
+  if (!isPlainObject(document)) return [];
   if (Array.isArray(document.objects)) {
-    const match = document.objects.filter(isPlainObject).find((entry) => entry.type === 'Match');
-    return match ?? null;
+    const objects = document.objects.filter(isPlainObject);
+    // Top-level matches first, so the first entry is the one a single-game document means.
+    const matches = objects.filter((entry) => entry.type === 'Match');
+    const seen = new Set(matches);
+    // A schedule may also write its games inline inside the rounds that hold them rather than as
+    // top-level objects. Those are the same games, and a file whose games are spelled that way is
+    // still a file whose games must not be imported twice.
+    for (const entry of objects) {
+      for (const phase of arrayOf(entry.phases)) {
+        for (const round of arrayOf(phase.rounds)) {
+          for (const match of arrayOf(round.matches)) {
+            if (typeof match.$ref === 'string' || seen.has(match)) continue;
+            seen.add(match);
+            matches.push(match);
+          }
+        }
+      }
+    }
+    return matches;
   }
   // A bare Match has no envelope. `match_teams` is the field that makes it recognisable as one.
-  if (Array.isArray(document.match_teams) || Array.isArray(document.matchTeams)) return document;
-  return null;
+  if (Array.isArray(document.match_teams) || Array.isArray(document.matchTeams)) return [document];
+  return [];
+}
+
+function arrayOf(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isPlainObject) : [];
 }
 
 /** The identity a result claims: the tournament that scopes it, and the scheduled game. */
@@ -219,8 +251,25 @@ function roundNumberForMatch(document: Record<string, unknown>, matchId: string)
  */
 export function readResultIdentity(document: unknown): IResultIdentity | null {
   const match = findResultMatch(document);
-  if (!match) return null;
+  return match ? identityForMatch(document, match) : null;
+}
 
+/** The identity carried by a `Match`, together with the `Match` it was read from. */
+export interface IResultMatchIdentity extends IResultIdentity {
+  match: Record<string, unknown>;
+}
+
+/**
+ * The identity of every `Match` in a result document, in document order.
+ *
+ * Each identity is read against the whole envelope, so a match still learns its tournament and its
+ * round from the objects that reference it rather than only from what it carries itself.
+ */
+export function readResultIdentities(document: unknown): IResultMatchIdentity[] {
+  return findResultMatchList(document).map((match) => ({ ...identityForMatch(document, match), match }));
+}
+
+function identityForMatch(document: unknown, match: Record<string, unknown>): IResultIdentity {
   const fingerprint = resultFingerprint(match);
   const identity: IResultIdentity = { fingerprint };
   const source = readResultSourceMetadata(match);

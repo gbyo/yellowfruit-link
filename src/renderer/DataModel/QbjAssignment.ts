@@ -69,17 +69,34 @@ function teamObject(team: Team): QbjNode {
 }
 
 /**
- * The Registration that owns a team, as a QBJ object naming only that team.
+ * The Registrations that own the teams playing, as QBJ objects naming only those teams.
  *
  * A registration can own several teams (a school's A and B squads), but an assignment names only the
  * teams that play, so the others are filtered out rather than sent to a room that has no use for
  * them.
+ *
+ * One object per registration, not per team. A school's A and B squads playing each other is an
+ * ordinary game, and emitting their shared registration twice would put two objects with the same
+ * QBJ id in one document - which makes every `$ref` to it ambiguous.
  */
-function registrationObjectFor(tournament: Tournament, team: Team): QbjNode {
-  const registration = tournament.registrations.find((reg) => reg.teams.includes(team));
-  const name = registration?.name ?? team.name;
-  const id = registration?.id ?? `Registration_${team.id}`;
-  return { type: 'Registration', id, name, teams: [{ $ref: team.id }] };
+function registrationObjectsFor(tournament: Tournament, teams: Team[]): QbjNode[] {
+  const byId = new Map<string, QbjNode>();
+  for (const team of teams) {
+    const registration = tournament.registrations.find((reg) => reg.teams.includes(team));
+    const id = registration?.id ?? `Registration_${team.id}`;
+    const existing = byId.get(id);
+    if (existing) {
+      (existing.teams as { $ref: string }[]).push({ $ref: team.id });
+      continue;
+    }
+    byId.set(id, {
+      type: 'Registration',
+      id,
+      name: registration?.name ?? team.name,
+      teams: [{ $ref: team.id }],
+    });
+  }
+  return [...byId.values()];
 }
 
 /**
@@ -93,15 +110,20 @@ function registrationObjectFor(tournament: Tournament, team: Team): QbjNode {
  *
  * Stated for every answer type rather than only the ambiguous ones, because "absent" is exactly what a
  * consumer is not allowed to interpret.
+ *
+ * A tournament with no bonuses has no answer type that awards one. The rules it publishes carry no
+ * bonus structure at all, so claiming a bonus follows a correct answer would send a scoresheet
+ * looking for questions the format does not have.
  */
 function stateAwardsBonusExplicitly(scoringRules: QbjNode): void {
   const { answerTypes } = scoringRules;
   if (!Array.isArray(answerTypes)) return;
+  const usesBonuses = scoringRules.maximumBonusScore !== undefined;
   for (const entry of answerTypes) {
     if (typeof entry !== 'object' || entry === null) continue;
     const answerType = entry as QbjNode;
     if (typeof answerType.awardsBonus !== 'boolean') {
-      answerType.awardsBonus = typeof answerType.value === 'number' && answerType.value > 0;
+      answerType.awardsBonus = usesBonuses && typeof answerType.value === 'number' && answerType.value > 0;
     }
   }
 }
@@ -151,7 +173,7 @@ export function buildAssignmentDocument(request: IAssignmentBuildRequest): objec
   };
 
   const teams = [leftTeam, rightTeam];
-  const registrations = teams.map((team) => registrationObjectFor(tournament, team));
+  const registrations = registrationObjectsFor(tournament, teams);
 
   const tournamentObject: QbjNode = {
     type: 'Tournament',

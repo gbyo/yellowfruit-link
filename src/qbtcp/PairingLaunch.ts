@@ -28,26 +28,31 @@ export function normalizeScoresheetUrl(raw: string): string | undefined {
   }
 }
 
-function validateServerBaseUrl(raw: string): string {
-  if (typeof raw !== 'string' || raw.trim() === '') {
-    throw new Error('The server address must be an HTTP or HTTPS URL.');
-  }
-
-  const trimmed = raw.trim();
+/**
+ * Whether a string is usable as the QBTCP server's base address.
+ *
+ * A base address is a host to append protocol paths to, so a query string or a fragment is not part
+ * of one - QBSheet refuses them outright. Accepting one here would print a QR code that this
+ * application generated and its intended client will not take.
+ */
+export function isValidServerBaseUrl(raw: string): boolean {
+  if (typeof raw !== 'string' || raw.trim() === '') return false;
   try {
-    const url = new URL(trimmed);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-      throw new Error('The server address must be an HTTP or HTTPS URL.');
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message === 'The server address must be an HTTP or HTTPS URL.') {
-      throw error;
-    }
-    throw new Error('The server address must be an HTTP or HTTPS URL.');
+    const url = new URL(raw.trim());
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    return url.search === '' && url.hash === '';
+  } catch {
+    return false;
+  }
+}
+
+function validateServerBaseUrl(raw: string): string {
+  if (!isValidServerBaseUrl(raw)) {
+    throw new Error('The server address must be an HTTP or HTTPS URL with no query string or #fragment.');
   }
   // Keep the spelling the director chose. URL above is used for validation; adding a trailing slash
   // here would change the launch string for the ordinary `http://host:port` address.
-  return trimmed;
+  return raw.trim();
 }
 
 /** Build the one canonical URL shared by QR codes and a future copy-link action. */

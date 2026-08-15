@@ -19,21 +19,12 @@ import {
 } from '@mui/material';
 import { TournamentContext } from '../TournamentManager';
 import { IRoomView } from '../../qbtcp/QbtcpState';
-import { defaultScoresheetUrl, normalizeScoresheetUrl } from '../../qbtcp/PairingLaunch';
+import { defaultScoresheetUrl, isValidServerBaseUrl, normalizeScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import { buildPairingSheetsHtml, SheetsPerPage } from '../Utils/PairingSheets';
 
 interface IPairingSheetsDialogProps {
   open: boolean;
   onClose: () => void;
-}
-
-function isHttpUrl(raw: string): boolean {
-  try {
-    const url = new URL(raw.trim());
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
 
 function isLoopbackAddress(raw: string): boolean {
@@ -75,7 +66,9 @@ export default function PairingSheetsDialog(props: IPairingSheetsDialogProps) {
   }, [open]);
 
   const selectedRooms = status.rooms.filter((room) => selectedRoomIds.includes(room.id));
-  const addressValid = isHttpUrl(serverAddress);
+  // The same rule the launch-URL builder applies, so the dialog cannot enable a Print button for an
+  // address that builder would refuse - or print one QBSheet would.
+  const addressValid = isValidServerBaseUrl(serverAddress);
   const normalizedScoresheetUrl = normalizeScoresheetUrl(scoresheetUrl);
   const scoresheetUrlValid = normalizedScoresheetUrl !== undefined;
   const previewRoom = selectedRooms[0];
@@ -166,7 +159,7 @@ export default function PairingSheetsDialog(props: IPairingSheetsDialogProps) {
               error={serverAddress !== '' && !addressValid}
               helperText={
                 serverAddress !== '' && !addressValid
-                  ? 'Enter an http:// or https:// address.'
+                  ? 'Enter an http:// or https:// address with no query string or #fragment.'
                   : 'This is the address the scorekeeper will use to reach this computer.'
               }
               onChange={(event) => setServerAddress(event.target.value)}

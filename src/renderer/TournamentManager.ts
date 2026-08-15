@@ -5,7 +5,7 @@ import Tournament, { IYftFileTournament, NullTournament } from './DataModel/Tour
 import { dateFieldChanged, getFileNameFromPath, textFieldChanged, versionLt } from './Utils/GeneralUtils';
 import { NullObjects } from './Utils/UtilTypes';
 import { IpcBidirectional, IpcMainToRend, IpcRendToMain } from '../IPCChannels';
-import { IIndeterminateQbj, IQbjWholeFile, IRefTargetDict } from './DataModel/Interfaces';
+import { IIndeterminateQbj, IQbjObject, IQbjWholeFile, IRefTargetDict } from './DataModel/Interfaces';
 import AnswerType from './DataModel/AnswerType';
 import StandardSchedule from './DataModel/StandardSchedule';
 import { Team } from './DataModel/Team';
@@ -13,7 +13,7 @@ import Registration, { IQbjRegistration } from './DataModel/Registration';
 import { TempTeamManager } from './Modal Managers/TempTeamManager';
 import { GenericModalManager } from './Modal Managers/GenericModalManager';
 import { collectRefTargets, findTournamentObject } from './DataModel/QbjUtils2';
-import FileParser from './DataModel/FileParsing';
+import FileParser, { roundNumberFromName } from './DataModel/FileParsing';
 import { TempMatchManager } from './Modal Managers/TempMatchManager';
 import { IModaqMatch, IQbjMatch, Match } from './DataModel/Match';
 import {
@@ -44,7 +44,7 @@ import SqbsGenerator from './DataModel/SqbsFileGeneration';
 import RoomsManager from './Modal Managers/RoomsManager';
 import { IReceivedResult } from '../qbtcp/QbtcpState';
 import { QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
-import { ResultComparison } from '../qbtcp/ResultFingerprint';
+import { ResultComparison, readResultIdentities, readResultIdentity } from '../qbtcp/ResultFingerprint';
 
 /** Holds the tournament the application is currently editing */
 export class TournamentManager {
@@ -126,7 +126,7 @@ export class TournamentManager {
    * Held until the director commits the import, then recorded. Recording them at parse time would put
    * a result on record that a cancelled import never turned into a match.
    */
-  private pendingFileResultsToRecord: string[] = [];
+  private pendingFileResultsToRecord: object[] = [];
 
   /** QBTCP results whose review is open. Resolved when the director commits or cancels. */
   private pendingQbtcpResultIds: string[] = [];
@@ -474,7 +474,7 @@ export class TournamentManager {
     const maxTeamsAllowed = this.tournament.getExpectedNumberOfTeams();
     let maxTeamsReached = false;
     for (const reg of registrationList) {
-      if (this.tournament.getNumberOfTeams() === maxTeamsAllowed) {
+      if (maxTeamsAllowed !== null && this.tournament.getNumberOfTeams() >= maxTeamsAllowed) {
         maxTeamsReached = true;
         break;
       }
@@ -513,11 +513,14 @@ export class TournamentManager {
     const existingRegistration = this.tournament.findRegistration(registrationFromFile.name);
     if (existingRegistration) {
       for (const teamFromFile of registrationFromFile.teams) {
+        // Checked before the team is added, and with `>=`. Checking afterwards for equality let a
+        // tournament already over its maximum take on every remaining team in the file, because the
+        // count it was compared against was one it had already passed.
+        if (maxTeamsAllowed !== null && this.tournament.getNumberOfTeams() >= maxTeamsAllowed) break;
         if (!this.tournament.findTeamByName(teamFromFile.name)) {
           existingRegistration.addTeam(teamFromFile);
           numTeamsImported++;
         }
-        if (this.tournament.getNumberOfTeams() === maxTeamsAllowed) break;
       }
       this.tournament.seedTeamsInRegistration(existingRegistration);
     } else {
@@ -616,9 +619,10 @@ export class TournamentManager {
 
       // Identity is read from the raw document, before case conversion, and from a plain parse rather
       // than the date-aware one. The QBTCP path fingerprints a plain parse of the same bytes, so both
-      // routes compute the same value for the same game by construction.
+      // routes compute the same value for the same game by construction. One answer per game in the
+      // file: a file whose first game is already on record says nothing about its other nine.
       // eslint-disable-next-line no-await-in-loop
-      const comparison = await classifyIncomingResult(fileContents);
+      const comparisons = await classifyIncomingResults(fileContents);
 
       const isBareCamelCaseMatch =
         !Array.isArray((objFromFile as { objects?: unknown }).objects) &&
@@ -628,11 +632,19 @@ export class TournamentManager {
       // a serialized QBJ document would overwrite matchTeams from the absent match_teams field.
       if (!isBareCamelCaseMatch) snakeCaseToCamelCase(objFromFile);
 
+      // A second, untouched parse. `objFromFile` is about to be case-converted in place, and a
+      // converted match hashes differently from the bytes the room sent, so the copy that identity
+      // is read from has to be the one nothing has rewritten.
+      const rawObjFromFile = plainParse(fileContents);
+
       const fileResults: MatchImportResult[] = [];
       if ((objFromFile as IQbjWholeFile).objects) {
-        fileResults.push(...this.importMatchesFromWholeQbj(objFromFile as IQbjWholeFile, filePath, phase, round));
+        fileResults.push(
+          ...this.importMatchesFromWholeQbj(objFromFile as IQbjWholeFile, filePath, phase, round, rawObjFromFile),
+        );
       } else {
         const oneResult: MatchImportResult = new MatchImportResult(filePath);
+        oneResult.sourceMatch = rawObjFromFile ?? undefined;
         fileResults.push(oneResult);
         const roundToUse = round ?? this.tournament.getRoundObjByNumber((objFromFile as IModaqMatch)._round);
         if (!roundToUse) {
@@ -645,7 +657,15 @@ export class TournamentManager {
         }
       }
 
-      this.annotateAlreadyRecorded(fileResults, comparison, fileContents);
+      annotateAlreadyRecorded(fileResults, comparisons);
+      for (const fileResult of fileResults) {
+        // Remembered per game, so a later automatic retry of any one of them is recognised. Recording
+        // only the file's first game would leave the rest able to arrive a second time. A game that
+        // could not be parsed into a match is not remembered: nothing was added for it to duplicate.
+        if (fileResult.match && fileResult.sourceMatch && fileResult.comparison?.kind === 'new') {
+          this.pendingFileResultsToRecord.push(fileResult.sourceMatch);
+        }
+      }
       results.push(...fileResults);
     }
 
@@ -655,44 +675,20 @@ export class TournamentManager {
   }
 
   /**
-   * Mark an import that duplicates or contradicts a result already on record.
-   *
-   * A duplicate is refused outright, because importing it would create a second match for one game.
-   * A conflict is surfaced and left for a person: two disagreeing results for the same game are never
-   * resolved automatically, and neither copy is discarded.
-   *
-   * Anything genuinely new is remembered so that a later automatic retry of the same game is
-   * recognised, which is the "network failed, control imported the file, the room reconnected" case.
-   */
-  private annotateAlreadyRecorded(
-    fileResults: MatchImportResult[],
-    comparison: ResultComparison | undefined,
-    fileContents: string,
-  ) {
-    if (!comparison || comparison.kind === 'new') {
-      if (comparison) this.pendingFileResultsToRecord.push(fileContents);
-      return;
-    }
-    for (const result of fileResults) {
-      if (comparison.kind === 'duplicate') {
-        result.markFatal('This result is already recorded in this tournament. No second game will be added.');
-      } else {
-        result.proceedWithImport = false;
-        result.markWarning(
-          'A different result is already recorded for this game. Both copies have been kept; review them before importing.',
-        );
-      }
-    }
-  }
-
-  /**
    * Import multiple matches from an arbitrary QBJ file
    * @param fileObj top-level file JSON object
    * @param phase phase we're importing matches into
    * @param round round we're importing matches into
    * @param filePath file that we're importing
+   * @param rawFileObj the same file, parsed and left unconverted, so each game keeps its own identity
    */
-  private importMatchesFromWholeQbj(fileObj: IQbjWholeFile, filePath: string, phase?: Phase, round?: Round) {
+  private importMatchesFromWholeQbj(
+    fileObj: IQbjWholeFile,
+    filePath: string,
+    phase?: Phase,
+    round?: Round,
+    rawFileObj?: object | null,
+  ) {
     const objectList = fileObj.objects;
     const importResults: MatchImportResult[] = [];
     const wholeFileFailureResult = new MatchImportResult(filePath);
@@ -718,22 +714,33 @@ export class TournamentManager {
       return importResults;
     }
 
+    // The same traversal over the unconverted parse. It reads only keys that case conversion leaves
+    // alone - type, id, phases, rounds, matches, name - so the two lists line up entry for entry,
+    // and each imported game can be paired with the exact bytes it arrived as.
+    const rawMatches = FileParser.findMatches(((rawFileObj as IQbjWholeFile | null)?.objects ?? []) as IQbjObject[]);
+
     const parser = new FileParser(refTargets, this.tournament, phase);
     parser.buildTypesByIdArrays(objectList);
-    for (const matchAndRound of matchesWithRoundNums) {
+    matchesWithRoundNums.forEach((matchAndRound, index) => {
       const singleResult = new MatchImportResult(filePath);
-      const roundToUse = round ?? this.tournament.getRoundObjByNumber(Number.parseInt(matchAndRound.roundName, 10));
+      if (rawMatches.length === matchesWithRoundNums.length) {
+        singleResult.sourceMatch = rawMatches[index].match as unknown as object;
+      }
+      importResults.push(singleResult);
+      const roundToUse = round ?? this.tournament.getRoundObjByNumber(roundNumberFromName(matchAndRound.roundName));
       if (roundToUse === undefined) {
+        // Pushed above rather than below, because the message built here is the only account the
+        // director gets of why this game was left out.
         singleResult.markFatal(`Couldn't find a round in this tournament matching "${matchAndRound.roundName}"`);
-        continue;
+        return;
       }
       const phaseToUse = phase ?? this.tournament.findPhaseByRound(roundToUse);
       if (phaseToUse === undefined) {
-        continue; // just ignore this match; this isn't plausible and I don't know how I would explain it to a user
+        singleResult.markFatal(`Round "${matchAndRound.roundName}" is not part of any stage of this tournament.`);
+        return;
       }
       this.importSingleMatchObj(matchAndRound.match, phaseToUse, roundToUse, singleResult, parser);
-      importResults.push(singleResult);
-    }
+    });
     return importResults;
   }
 
@@ -1547,9 +1554,8 @@ export class TournamentManager {
         return;
       }
 
-      for (const contents of documents) {
+      for (const document of documents) {
         try {
-          const document = JSON.parse(contents);
           // eslint-disable-next-line no-await-in-loop
           const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
             kind: 'recordFileResult',
@@ -1886,34 +1892,77 @@ class NullTournamentManager extends TournamentManager {
   setFilePath(): void {}
 }
 
-/** React context that elements can use to access the TournamentManager and its data without
- * having to thread data and data-changing functions up and down the react tree
- */
-/**
- * Ask the Rooms adapter whether this document is already on record.
- *
- * Returns undefined when the adapter has nothing to say - no tournament bound, the document holds
- * more than one game, or the command failed. An unavailable adapter must never block a manual
- * import: file workflows have to keep working whether or not QBTCP is in use.
- */
-async function classifyIncomingResult(fileContents: string): Promise<ResultComparison | undefined> {
-  let document: unknown;
+/** A parse with nothing applied to it - no date reviver, no case conversion. */
+function plainParse(fileContents: string): object | null {
   try {
-    document = JSON.parse(fileContents);
+    const parsed: unknown = JSON.parse(fileContents);
+    return parsed && typeof parsed === 'object' ? (parsed as object) : null;
   } catch {
-    return undefined;
+    return null;
   }
-  if (!document || typeof document !== 'object') return undefined;
+}
+
+/**
+ * Ask the Rooms adapter how each game in this document stands against what is on record.
+ *
+ * Keyed by statistical fingerprint rather than by position, so a caller can look up the answer for
+ * one game without the two sides having to agree on how a file's games are ordered.
+ *
+ * Returns undefined when the adapter has nothing to say - no tournament bound, or the command
+ * failed. An unavailable adapter must never block a manual import: file workflows have to keep
+ * working whether or not QBTCP is in use.
+ */
+async function classifyIncomingResults(fileContents: string): Promise<Map<string, ResultComparison> | undefined> {
+  const document = plainParse(fileContents);
+  if (!document) return undefined;
   try {
     const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
-      kind: 'classifyResult',
+      kind: 'classifyResults',
       document,
     })) as QbtcpCommandResult;
-    if (reply?.ok && 'comparison' in reply) return reply.comparison;
+    if (!reply?.ok || !('comparisons' in reply)) return undefined;
+    const identities = readResultIdentities(document);
+    if (identities.length !== reply.comparisons.length) return undefined;
+    return new Map(identities.map((identity, index) => [identity.fingerprint, reply.comparisons[index]]));
   } catch {
     // The adapter is optional. Nothing about a manual import depends on it answering.
   }
   return undefined;
 }
 
+/**
+ * Mark each imported game that duplicates or contradicts a result already on record.
+ *
+ * A duplicate is refused outright, because importing it would create a second match for one game.
+ * A conflict is surfaced and left for a person: two disagreeing results for the same game are never
+ * resolved automatically, and neither copy is discarded.
+ *
+ * Per game, never per file. One verdict spread across a file's games would mark nine new games as
+ * already recorded because the tenth was.
+ */
+function annotateAlreadyRecorded(
+  fileResults: MatchImportResult[],
+  comparisons: Map<string, ResultComparison> | undefined,
+): void {
+  if (!comparisons) return;
+  for (const result of fileResults) {
+    if (!result.sourceMatch) continue;
+    const identity = readResultIdentity(result.sourceMatch);
+    const comparison = identity ? comparisons.get(identity.fingerprint) : undefined;
+    if (!comparison) continue;
+    result.comparison = comparison;
+    if (comparison.kind === 'duplicate') {
+      result.markFatal('This result is already recorded in this tournament. No second game will be added.');
+    } else if (comparison.kind === 'conflict') {
+      result.proceedWithImport = false;
+      result.markWarning(
+        'A different result is already recorded for this game. Both copies have been kept; review them before importing.',
+      );
+    }
+  }
+}
+
+/** React context that elements can use to access the TournamentManager and its data without
+ * having to thread data and data-changing functions up and down the react tree
+ */
 export const TournamentContext = createContext<TournamentManager>(new NullTournamentManager());

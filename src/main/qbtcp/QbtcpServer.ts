@@ -41,6 +41,7 @@ import {
   deviceIdHeader,
   operatorNameHeader,
   pairingRateLimit,
+  presenceFreshMs,
   qbjMediaType,
   qbjVersion,
   qbtcpPrefix,
@@ -53,12 +54,14 @@ import {
   IRoom,
   IRoomAssignment,
   ISession,
+  ISessionGrant,
   emptyQbtcpState,
 } from '../../qbtcp/QbtcpState';
 import {
   ResultComparison,
   compareToRecorded,
   findResultMatch,
+  readResultIdentities,
   readResultIdentity,
   readResultSourceMetadata,
   stripCredentialKeys,
@@ -144,6 +147,28 @@ export default class QbtcpServer {
     const loaded = await this.store.load(tournamentId);
     this.state = loaded.state;
     this.stateProblem = loaded.problem;
+    this.refreshAllowedOrigins();
+  }
+
+  /**
+   * Recompute which browser origins may reach this server.
+   *
+   * The director can point the pairing sheets at a self-hosted QBSheet, and a printed QR code that
+   * this application generated has to work against the server that generated it. So the chosen
+   * scoresheet's origin joins the allowlist. It is still an exact origin, never a wildcard: the one
+   * added entry is an address a person deliberately typed into the pairing-sheet dialog.
+   */
+  private refreshAllowedOrigins(): void {
+    const chosen = originOf(this.state.scoresheetUrl);
+    this.allowedOrigins =
+      chosen && !defaultAllowedOrigins.includes(chosen) ? [...defaultAllowedOrigins, chosen] : defaultAllowedOrigins;
+  }
+
+  /** Whether a result for this room is still waiting for the director to decide what to do with it. */
+  private hasUnresolvedResult(roomId: string): boolean {
+    return this.state.results.some(
+      (result) => result.roomId === roomId && (result.status === 'needs-review' || result.status === 'conflict'),
+    );
   }
 
   /** Whether any session holds scored work that nobody has resolved yet. */
@@ -265,6 +290,7 @@ export default class QbtcpServer {
     if (!normalized) throw new Error('The scoresheet address must be an HTTP or HTTPS URL.');
     if (this.state.scoresheetUrl === normalized) return;
     this.state.scoresheetUrl = normalized;
+    this.refreshAllowedOrigins();
     await this.store.save(this.state);
   }
 
@@ -299,10 +325,20 @@ export default class QbtcpServer {
    *
    * The revision increases whenever a room's assignment is replaced, so that a result scored against
    * a superseded pairing is detectable rather than indistinguishable from a current one. An unfinished
-   * session locks the room even when no progress snapshot has arrived yet.
+   * session locks the room even when no progress snapshot has arrived yet, and so does a received
+   * result nobody has decided about: `finalReceived` only means the bytes are safe on disk, not that
+   * the game is settled, and replacing the assignment underneath it would leave the review pointing at
+   * a pairing this room is no longer playing.
+   *
+   * `expectedRevision` is the revision the caller baked into the document it is handing over. The
+   * renderer computes it from the status it last saw, so two commands issued from one stale snapshot
+   * would otherwise both claim revision N+1 while the second stored record became N+2 - and a
+   * correctly scored result would then be refused as stale. Refusing the second command is the honest
+   * answer: the page it was issued from was out of date.
    */
   async setAssignment(
     assignment: Omit<IRoomAssignment, 'id' | 'revision'>,
+    expectedRevision?: number,
   ): Promise<IRoomAssignment | { assigned: false; reason: string }> {
     if (this.state.sessions.some((session) => session.roomId === assignment.roomId && !session.finalReceived)) {
       return {
@@ -310,11 +346,24 @@ export default class QbtcpServer {
         reason: 'This room has an unfinished scoring session. Wait for its result before changing the assignment.',
       };
     }
+    if (this.hasUnresolvedResult(assignment.roomId)) {
+      return {
+        assigned: false,
+        reason: 'This room has a result waiting for review. Resolve it before changing the assignment.',
+      };
+    }
     const previous = this.state.assignments.find((a) => a.roomId === assignment.roomId);
+    const revision = (previous?.revision ?? 0) + 1;
+    if (expectedRevision !== undefined && expectedRevision !== revision) {
+      return {
+        assigned: false,
+        reason: 'The Rooms page was out of date. Refresh it and make this assignment again.',
+      };
+    }
     const stored: IRoomAssignment = {
       ...assignment,
       id: previous?.id ?? makeOpaqueId('asg-', 6),
-      revision: (previous?.revision ?? 0) + 1,
+      revision,
     };
     this.state.assignments = this.state.assignments.filter((a) => a.roomId !== assignment.roomId);
     this.state.assignments.push(stored);
@@ -326,6 +375,9 @@ export default class QbtcpServer {
     const session = this.state.sessions.find((s) => s.roomId === roomId && !s.finalReceived);
     if (session) {
       return { cleared: false, reason: 'This room has an unfinished scoring session. Wait for its result first.' };
+    }
+    if (this.hasUnresolvedResult(roomId)) {
+      return { cleared: false, reason: 'This room has a result waiting for review. Resolve it first.' };
     }
     this.state.assignments = this.state.assignments.filter((a) => a.roomId !== roomId);
     await this.store.save(this.state);
@@ -354,18 +406,36 @@ export default class QbtcpServer {
   }
 
   /**
-   * How a document stands against what is already recorded, without recording it.
+   * Whether a document claims to belong to a tournament other than the one this state is bound to.
    *
-   * The manual import path uses this to tell a director "this is the backup copy of a result you
-   * already have" instead of quietly creating a second match for the same game.
+   * Recorded results are scoped to one tournament, so a document from a different one can never be
+   * the same game as any of them however its `Match.id` reads. Two tournaments that both number their
+   * games from a common counter would otherwise report a stranger's game as this one's duplicate.
    */
-  classifyResult(document: object): ResultComparison {
-    const identity = readResultIdentity(document);
-    if (!identity) return { kind: 'new' };
+  private belongsToAnotherTournament(tournamentId?: string): boolean {
+    return tournamentId !== undefined && tournamentId !== this.state.tournamentId;
+  }
+
+  private compareOne(identity: { matchId?: string; fingerprint: string; tournamentId?: string }): ResultComparison {
+    if (this.belongsToAnotherTournament(identity.tournamentId)) return { kind: 'new' };
     return compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
       this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
     );
+  }
+
+  /**
+   * How a document stands against what is already recorded, without recording it.
+   *
+   * The manual import path uses this to tell a director "this is the backup copy of a result you
+   * already have" instead of quietly creating a second match for the same game.
+   *
+   * One answer per `Match` in the document, in document order. A file can hold a whole day of games,
+   * and one answer applied to all of them would mark nine new games as duplicates because the tenth
+   * was one.
+   */
+  classifyResults(document: object): ResultComparison[] {
+    return readResultIdentities(document).map((identity) => this.compareOne(identity));
   }
 
   /**
@@ -374,30 +444,37 @@ export default class QbtcpServer {
    * The manual path calls this so that a later network retry of the same game is recognised as a
    * duplicate. Without it, "control imported the file, then the room reconnected" would produce a
    * second match, which is one of the cases this adapter exists to prevent.
+   *
+   * Every `Match` in the document is recorded, not just the first: a multi-game file whose later
+   * games were left out of dedup state is exactly the file whose later games arrive twice.
    */
   async recordFileResult(document: object): Promise<void> {
-    const identity = readResultIdentity(document);
-    if (!identity) return;
-    if (identity.tournamentId && identity.tournamentId !== this.state.tournamentId) {
+    const identities = readResultIdentities(document);
+    // Checked across the whole document before anything is written, so a file with one foreign game
+    // in it is refused rather than half recorded.
+    if (identities.some((identity) => this.belongsToAnotherTournament(identity.tournamentId))) {
       throw new Error('That result belongs to a different tournament.');
     }
-    const comparison = compareToRecorded(
-      { matchId: identity.matchId, fingerprint: identity.fingerprint },
-      this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
-    );
-    if (comparison.kind !== 'new') return;
-    this.state.results.push({
-      id: makeOpaqueId('res-', 8),
-      roomId: '',
-      sessionId: '',
-      matchId: identity.matchId ?? '',
-      fingerprint: identity.fingerprint,
-      status: 'accepted',
-      document: stripCredentialKeys(document) as object,
-      receivedAt: new Date().toISOString(),
-      ...(identity.roundNumber !== undefined ? { roundNumber: identity.roundNumber } : {}),
-    });
-    await this.store.save(this.state);
+
+    let recorded = false;
+    for (const identity of identities) {
+      if (this.compareOne(identity).kind !== 'new') continue;
+      this.state.results.push({
+        id: makeOpaqueId('res-', 8),
+        roomId: '',
+        sessionId: '',
+        matchId: identity.matchId ?? '',
+        fingerprint: identity.fingerprint,
+        status: 'accepted',
+        // The `Match` alone, which is what a later arrival is compared against. Keeping the whole
+        // file against every one of its games would store the same day of play ten times over.
+        document: stripCredentialKeys(identity.match) as object,
+        receivedAt: new Date().toISOString(),
+        ...(identity.roundNumber !== undefined ? { roundNumber: identity.roundNumber } : {}),
+      });
+      recorded = true;
+    }
+    if (recorded) await this.store.save(this.state);
   }
 
   // --- request handling -----------------------------------------------------------------------
@@ -572,6 +649,16 @@ export default class QbtcpServer {
     // A fresh token per pairing: a device that pairs again invalidates the previous one, which is
     // how a room recovers from a token that leaked onto a projector.
     room.roomToken = `rt-${randomBytes(24).toString('hex')}`;
+    // The session capabilities go with it. Revoking the room token while leaving an open session's
+    // token alive would let the device whose pairing was deliberately revoked keep writing to the
+    // game it was removed from. The newly paired device reopens the session and is issued a fresh
+    // grant, so nothing is lost but the revoked device's access.
+    for (const session of this.state.sessions) {
+      if (session.roomId === room.id) session.grants = [];
+    }
+    // The previous device's operator name and heartbeat describe somebody who is no longer this
+    // room's scorekeeper, so the room reads as waiting until the new device is heard from.
+    this.state.presence = this.state.presence.filter((entry) => entry.roomId !== room.id);
     await this.store.save(this.state);
     this.pairingLimiter.clear(source);
     this.hooks.onStateChanged();
@@ -597,16 +684,28 @@ export default class QbtcpServer {
     return room;
   }
 
-  private authorizeSession(sessionId: string, request: IncomingMessage, response: ServerResponse): ISession | null {
+  /**
+   * Resolve the session *and the grant it was reached with*, or refuse.
+   *
+   * The grant matters as much as the session. It names the device the capability was issued to, which
+   * is what lets a write be attributed without depending on an informational header the client is
+   * free to omit.
+   */
+  private authorizeSession(
+    sessionId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): { session: ISession; grant: ISessionGrant } | null {
     const token = headerValue(request, sessionTokenHeader);
     const session = this.state.sessions.find((entry) => entry.id === sessionId);
     // The token must match this session, not merely be a valid token somewhere: a session capability
     // reaches exactly one session.
-    if (!session || !token || session.sessionToken !== token) {
+    const grant = token ? session?.grants.find((entry) => entry.token === token) : undefined;
+    if (!session || !grant) {
       sendJson(response, 401, { error: 'This session is not open.' });
       return null;
     }
-    return session;
+    return { session, grant };
   }
 
   // --- assignment status ----------------------------------------------------------------------
@@ -621,7 +720,9 @@ export default class QbtcpServer {
       state: assignment ? 'assigned' : 'none',
       blocked_reason: null,
       blocked_message: null,
-      session: session ? { session_id: session.id, resumable: true } : null,
+      // A game whose final is already on record is finished, not resumable. Offering to resume it
+      // invites a second scoring pass over a game this application has already accepted.
+      session: session ? { session_id: session.id, resumable: !session.finalReceived } : null,
       ...(assignment ? { released_round: assignment.roundNumber } : {}),
       hold_new_starts: false,
       next: null,
@@ -666,11 +767,19 @@ export default class QbtcpServer {
       // Reopening never transfers the lock: an automatic transfer is exactly how two devices end up
       // both believing they are authoritative.
       const isWriter = existing.writerDeviceId === null || existing.writerDeviceId === (deviceId ?? null);
-      if (existing.writerDeviceId === null && deviceId) {
-        existing.writerDeviceId = deviceId;
-        await this.store.save(this.state);
-      }
-      sendJson(response, 200, { session_id: existing.id, token: existing.sessionToken, writer: isWriter });
+      if (existing.writerDeviceId === null && deviceId) existing.writerDeviceId = deviceId;
+      // A capability of its own, so this device's later writes carry its identity even though the
+      // protocol's device header is informational and QBSheet does not send it on a write.
+      const grant = grantFor(existing, deviceId ?? null);
+      await this.store.save(this.state);
+      sendJson(response, 200, {
+        session_id: existing.id,
+        token: grant.token,
+        writer: isWriter,
+        // A retry of an already-delivered final still needs its session; saying so is what stops a
+        // client presenting a finished game as one it may carry on scoring.
+        final_received: existing.finalReceived,
+      });
       return;
     }
 
@@ -679,17 +788,18 @@ export default class QbtcpServer {
       id: makeOpaqueId('sess-', 8),
       roomId: room.id,
       matchId,
-      sessionToken: `st-${randomBytes(24).toString('hex')}`,
+      grants: [],
       writerDeviceId: deviceId ?? null,
       progressSequence: 0,
       finalReceived: false,
       createdAt: now,
       updatedAt: now,
     };
+    const grant = grantFor(session, deviceId ?? null);
     this.state.sessions.push(session);
     await this.store.save(this.state);
     this.hooks.onStateChanged();
-    sendJson(response, 200, { session_id: session.id, token: session.sessionToken, writer: true });
+    sendJson(response, 200, { session_id: session.id, token: grant.token, writer: true, final_received: false });
   }
 
   private async handleSessionRoute(
@@ -699,8 +809,9 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    const session = this.authorizeSession(sessionId, request, response);
-    if (!session) return;
+    const authorized = this.authorizeSession(sessionId, request, response);
+    if (!authorized) return;
+    const { session, grant } = authorized;
 
     if (kind === 'recovery' && method === 'GET') {
       const assignment = this.state.assignments.find((a) => a.matchId === session.matchId);
@@ -717,17 +828,17 @@ export default class QbtcpServer {
     }
 
     if (kind === 'writer' && method === 'POST') {
-      await this.handleWriterTakeover(session, request, response);
+      await this.handleWriterTakeover(session, grant, request, response);
       return;
     }
 
     if (kind === 'progress' && method === 'PUT') {
-      await this.handleProgress(session, request, response);
+      await this.handleProgress(session, grant, request, response);
       return;
     }
 
     if (kind === 'result' && method === 'POST') {
-      await this.handleResult(session, request, response);
+      await this.handleResult(session, grant, request, response);
       return;
     }
 
@@ -736,6 +847,7 @@ export default class QbtcpServer {
 
   private async handleWriterTakeover(
     session: ISession,
+    grant: ISessionGrant,
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
@@ -746,12 +858,23 @@ export default class QbtcpServer {
       sendJson(response, 400, { error: 'A change of writer has to be asked for explicitly.' });
       return;
     }
-    session.writerDeviceId = stringField(body.device_id, 256) ?? null;
+    // The device that presented the capability, falling back to one it names. A takeover that named
+    // nobody used to leave the lock unowned, which does not transfer exclusivity - it ends it, for
+    // every holder of a token on this session.
+    const claimant = grant.deviceId ?? stringField(body.device_id, 256);
+    if (!claimant) {
+      sendJson(response, 400, { error: 'A change of writer has to say which device is taking over.' });
+      return;
+    }
+    session.writerDeviceId = claimant;
+    // The grant this request arrived on now belongs to the writer, so its later writes are
+    // attributable even when it never sends the device header again.
+    grant.deviceId = claimant;
     session.updatedAt = new Date().toISOString();
     await this.store.save(this.state);
     this.hooks.onStateChanged();
     // The token does not change on a transfer; only who may write with it does.
-    sendJson(response, 200, { session_id: session.id, token: session.sessionToken, writer: true });
+    sendJson(response, 200, { session_id: session.id, token: grant.token, writer: true });
   }
 
   /**
@@ -762,8 +885,19 @@ export default class QbtcpServer {
    * held is discarded with a `200`: the client is late rather than wrong, and an error would only
    * cause a pointless retry. Nothing here ever reaches YellowFruit's statistics.
    */
-  private async handleProgress(session: ISession, request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (writerRefused(session, request, response)) return;
+  private async handleProgress(
+    session: ISession,
+    grant: ISessionGrant,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (writerRefused(session, grant, request, response)) return;
+    if (session.finalReceived) {
+      // The recovery state of a game this application has already accepted must not keep moving.
+      // Whatever this snapshot says, it describes a game that is over.
+      sendJson(response, 409, { error: 'This game’s result has already been received.' });
+      return;
+    }
 
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
@@ -779,6 +913,14 @@ export default class QbtcpServer {
       sendJson(response, 400, { error: 'A progress snapshot needs a match.' });
       return;
     }
+    // A snapshot that names a game is checked against this session's game. It is not required to
+    // name one - a match in progress may not carry its identity yet - but a snapshot that names the
+    // wrong one would replace this session's recovery state with another game's.
+    const snapshotError = this.snapshotIdentityError(body.match, session);
+    if (snapshotError) {
+      sendJson(response, 409, { error: snapshotError });
+      return;
+    }
 
     session.progressSequence = body.sequence;
     session.progressMatch = stripCredentialKeys(body.match) as object;
@@ -791,14 +933,38 @@ export default class QbtcpServer {
   }
 
   /**
+   * Why a progress snapshot cannot belong to this session, or undefined when nothing rules it out.
+   *
+   * Deliberately permissive about absence and strict about disagreement. A snapshot that carries no
+   * identity is the ordinary case for a game a scoresheet is still filling in; one that carries a
+   * different game's identity is never a snapshot of this game.
+   */
+  private snapshotIdentityError(match: Record<string, unknown>, session: ISession): string | undefined {
+    const identity = readResultIdentity(match);
+    if (!identity) return undefined;
+    if (identity.matchId && identity.matchId !== session.matchId) {
+      return 'That snapshot does not belong to this scoring session.';
+    }
+    if (this.belongsToAnotherTournament(identity.tournamentId)) {
+      return 'That snapshot belongs to a different tournament.';
+    }
+    return undefined;
+  }
+
+  /**
    * Receive the completed game.
    *
    * The ordering here is the durability contract described at the top of this file. Note that a
    * conflicting result is still persisted before it is refused: retaining both copies is what lets a
    * director resolve the disagreement, and discarding the loser would destroy the evidence.
    */
-  private async handleResult(session: ISession, request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (writerRefused(session, request, response)) return;
+  private async handleResult(
+    session: ISession,
+    grant: ISessionGrant,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (writerRefused(session, grant, request, response)) return;
 
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
@@ -952,28 +1118,59 @@ export default class QbtcpServer {
   }
 }
 
+/** The capability this session has already issued to a device, or a fresh one. */
+function grantFor(session: ISession, deviceId: string | null): ISessionGrant {
+  const existing = deviceId === null ? undefined : session.grants.find((entry) => entry.deviceId === deviceId);
+  if (existing) return existing;
+  const grant: ISessionGrant = { deviceId, token: `st-${randomBytes(24).toString('hex')}` };
+  session.grants.push(grant);
+  return grant;
+}
+
 /**
- * Refuse a write that another device owns, when the writer can be identified.
+ * Refuse a write from a device that does not hold the writer lock.
  *
- * The device id is an informational header, and current QBSheet does not send it on a session write
- * - only when opening a session. So the lock is enforced here for a client that does identify
- * itself, and a write from an unidentified client is accepted rather than refused, because refusing
- * it would refuse the legitimate writer too. The enforcement a client actually observes today is at
- * session open, which reports `writer: false` to the device that does not hold the lock.
+ * The authority is the grant the request arrived on, not the device header. The header is
+ * informational and current QBSheet sends it only when opening a session, so a lock enforced against
+ * it would be no lock at all - a second device told `writer: false` could simply omit the header and
+ * write anyway. The capability cannot be omitted: it is what authorized the request in the first
+ * place, and it was issued to exactly one device.
+ *
+ * A session whose writer is unidentified (`null`) still admits any holder. That is not a hole but the
+ * only honest answer when no device on the session ever said who it was; there is nothing to
+ * distinguish them by.
  *
  * `409` rather than `401` on purpose: the session token is perfectly valid, and a device without the
  * lock may read. Conflating them would send a room hunting for a pairing code to fix a problem that
  * a person standing next to the other device has to resolve.
  */
-function writerRefused(session: ISession, request: IncomingMessage, response: ServerResponse): boolean {
-  const deviceId = headerValue(request, deviceIdHeader);
-  if (!deviceId || session.writerDeviceId === null || session.writerDeviceId === deviceId) return false;
+function writerRefused(
+  session: ISession,
+  grant: ISessionGrant,
+  request: IncomingMessage,
+  response: ServerResponse,
+): boolean {
+  if (session.writerDeviceId === null) return false;
+  const claimedDeviceId = headerValue(request, deviceIdHeader);
+  const holdsLock = grant.deviceId === session.writerDeviceId;
+  if (holdsLock && (claimedDeviceId === undefined || claimedDeviceId === session.writerDeviceId)) return false;
   sendJson(response, 409, {
     error: 'Another device is scoring this game.',
     writer_device: session.writerDeviceId,
     can_take_over: true,
   });
   return true;
+}
+
+/** The origin of a URL, or undefined when there is not one to speak of. */
+function originOf(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    const { origin } = new URL(url);
+    return origin === 'null' ? undefined : origin;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Validate the identity and assignment metadata before a final can be compared or stored. */
@@ -1085,8 +1282,6 @@ function makePairingCode(): string {
 function clientSource(request: IncomingMessage): string {
   return request.socket.remoteAddress ?? 'unknown';
 }
-
-const presenceFreshMs = 45_000;
 
 function isRecent(timestamp?: string): boolean {
   if (!timestamp) return false;

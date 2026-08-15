@@ -218,7 +218,14 @@ export class Phase implements IQbjPhase, IYftDataModelObject {
     const newRoundArray: Round[] = [];
     let curRequestedRound = firstRound;
     for (const rd of this.rounds) {
-      if (rd.number > lastRound || rd.number < firstRound) break;
+      // Past the end of the new range: rounds are in ascending order, so nothing after this one can
+      // be in range either.
+      if (rd.number > lastRound) break;
+      // Before the start of it. This round is being dropped, but the ones after it are not - a
+      // `break` here discarded every remaining round's games and rebuilt them empty, which is the
+      // one thing changing a round range must never do.
+      // eslint-disable-next-line no-continue
+      if (rd.number < firstRound) continue;
 
       if (rd.number > curRequestedRound) {
         for (let i = curRequestedRound; i < rd.number; i++) {

@@ -37,8 +37,16 @@ import { TournamentContext } from '../TournamentManager';
 import YfCard from './YfCard';
 import PairingSheetsDialog from './PairingSheetsDialog';
 import { IRoomView } from '../../qbtcp/QbtcpState';
-import { isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { isValidQbtcpPort, presenceFreshMs } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
+
+/**
+ * How often this page re-reads room status while it is open.
+ *
+ * A third of the presence window, so a room that stops sending heartbeats reads as stale within a
+ * few seconds of actually being stale rather than a lapse later.
+ */
+const presenceRefreshMs = Math.round(presenceFreshMs / 3);
 
 function RoomsPage() {
   const tournManager = useContext(TournamentContext);
@@ -49,7 +57,12 @@ function RoomsPage() {
   useEffect(() => {
     rooms.dataChangedReactCallback = () => forceUpdate({});
     rooms.refresh();
+    // Presence expires on a clock, and a room that has gone quiet sends nothing to say so. Without a
+    // tick of its own this page would keep a dead Chromebook on screen as "Scoring" until something
+    // else happened to refresh it, which is the one moment a director needs the truth.
+    const timer = setInterval(() => rooms.pollStatus(), presenceRefreshMs);
     return () => {
+      clearInterval(timer);
       rooms.dataChangedReactCallback = () => {};
     };
   }, [rooms]);
@@ -204,7 +217,12 @@ function RoomRow(props: IRoomRowProps) {
   const { room } = props;
   const tournManager = useContext(TournamentContext);
   const rooms = tournManager.roomsManager;
-  const assignmentLocked = !!room.session && !room.session.finalReceived;
+  // A received final is not a settled game. Until the director has decided what to do with it, the
+  // pairing it was scored against has to stay put, or the review ends up pointing at a game this
+  // room is no longer playing. The main process refuses these commands for the same reason.
+  const awaitingReview = room.result?.status === 'needs-review' || room.result?.status === 'conflict';
+  const assignmentLocked = (!!room.session && !room.session.finalReceived) || awaitingReview;
+  const lockReason = awaitingReview ? 'Review this room’s result' : 'Finish the current scoring session';
   const [assignOpen, setAssignOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [newName, setNewName] = useState(room.name);
@@ -227,30 +245,20 @@ function RoomRow(props: IRoomRowProps) {
         </TableCell>
         <TableCell align="right">
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-            <Tooltip
-              describeChild
-              title={
-                assignmentLocked ? 'Finish the current scoring session before changing the assignment.' : ''
-              }
-            >
+            <Tooltip describeChild title={assignmentLocked ? `${lockReason} before changing the assignment.` : ''}>
               <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
-                <Button size="small" disabled={assignmentLocked} onClick={() => setAssignOpen(true)}>
+                <Button size="small" disabled={assignmentLocked || rooms.busy} onClick={() => setAssignOpen(true)}>
                   {room.assignment ? 'Change' : 'Assign'}
                 </Button>
               </span>
             </Tooltip>
             {room.assignment && (
               <>
-                <Tooltip
-                  describeChild
-                  title={
-                    assignmentLocked ? 'Finish the current scoring session before clearing the assignment.' : ''
-                  }
-                >
+                <Tooltip describeChild title={assignmentLocked ? `${lockReason} before clearing the assignment.` : ''}>
                   <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                     <Button
                       size="small"
-                      disabled={assignmentLocked}
+                      disabled={assignmentLocked || rooms.busy}
                       onClick={() => rooms.clearAssignment(room.id)}
                     >
                       Clear
@@ -286,17 +294,12 @@ function RoomRow(props: IRoomRowProps) {
                 <Edit fontSize="small" />
               </IconButton>
             </Tooltip>
-            <Tooltip
-              describeChild
-              title={
-                assignmentLocked ? 'Finish the current scoring session before removing the room.' : 'Remove room'
-              }
-            >
+            <Tooltip describeChild title={assignmentLocked ? `${lockReason} before removing the room.` : 'Remove room'}>
               <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                 <IconButton
                   size="small"
                   aria-label="Remove room"
-                  disabled={assignmentLocked}
+                  disabled={assignmentLocked || rooms.busy}
                   onClick={() =>
                     tournManager.genericModalManager.open(
                       'Remove Room',

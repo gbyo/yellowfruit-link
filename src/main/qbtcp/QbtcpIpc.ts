@@ -13,7 +13,7 @@ import fs from 'fs';
 import { IpcBidirectional, IpcMainToRend } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
 import { IQbtcpServerStatus, IRoomView } from '../../qbtcp/QbtcpState';
-import { defaultQbtcpPort, isValidQbtcpPort } from '../../qbtcp/QbtcpProtocol';
+import { defaultQbtcpPort, isValidQbtcpPort, presenceFreshMs } from '../../qbtcp/QbtcpProtocol';
 import { defaultScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import QbtcpServer, { lanAddresses } from './QbtcpServer';
 import QbtcpStore from './QbtcpStore';
@@ -62,13 +62,21 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
 
   const rooms: IRoomView[] = state.rooms.map((room) => {
     const assignment = state.assignments.find((a) => a.roomId === room.id);
+    const roomSessions = state.sessions.filter((s) => s.roomId === room.id);
+    // With an assignment, the session for the game the room is playing now. Without one, the newest
+    // session it ever had: `find` would return the oldest, so a room whose assignment was just
+    // cleared would report "Final received" for a game from hours ago.
     const session = assignment
-      ? state.sessions.find((s) => s.roomId === room.id && s.matchId === assignment.matchId)
-      : state.sessions.find((s) => s.roomId === room.id);
+      ? roomSessions.find((s) => s.matchId === assignment.matchId)
+      : roomSessions[roomSessions.length - 1];
     const presence = state.presence.find((p) => p.roomId === room.id);
     const tossupsRead = readTossupsRead(session?.progressMatch);
-    // The newest result for this room is the one a director acts on.
-    const result = [...state.results].reverse().find((r) => r.roomId === room.id);
+    // The result for the game this room is playing now, and only that game. The newest result for
+    // the room would keep the last game's verdict in the Result column after the next game was
+    // assigned, which reads as a verdict on the new game.
+    const result = [...state.results]
+      .reverse()
+      .find((r) => r.roomId === room.id && (assignment ? r.matchId === assignment.matchId : true));
 
     const lastSeen = presence?.lastSeenAt ? Date.parse(presence.lastSeenAt) : NaN;
     return {
@@ -77,7 +85,9 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
       pairingCode: room.pairingCode,
       enabled: room.enabled,
       paired: room.roomToken !== undefined,
-      connected: Number.isFinite(lastSeen) && Date.now() - lastSeen < 45_000,
+      // A stopped server hears no heartbeats, so nothing can be connected to it however recently it
+      // was last heard from.
+      connected: instance.running && Number.isFinite(lastSeen) && Date.now() - lastSeen < presenceFreshMs,
       ...(presence?.lastSeenAt ? { lastSeenAt: presence.lastSeenAt } : {}),
       ...(presence?.operatorName ? { operatorName: presence.operatorName } : {}),
       ...(assignment
@@ -173,16 +183,19 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
       return { ok: true, status: buildStatus(instance) };
     }
     case 'setAssignment': {
-      const outcome = await instance.setAssignment({
-        roomId: command.roomId,
-        roundNumber: command.roundNumber,
-        leftTeamId: command.leftTeamId,
-        rightTeamId: command.rightTeamId,
-        leftTeamName: command.leftTeamName,
-        rightTeamName: command.rightTeamName,
-        matchId: command.matchId,
-        document: command.document,
-      });
+      const outcome = await instance.setAssignment(
+        {
+          roomId: command.roomId,
+          roundNumber: command.roundNumber,
+          leftTeamId: command.leftTeamId,
+          rightTeamId: command.rightTeamId,
+          leftTeamName: command.leftTeamName,
+          rightTeamName: command.rightTeamName,
+          matchId: command.matchId,
+          document: command.document,
+        },
+        command.roundRevision,
+      );
       if ('assigned' in outcome && !outcome.assigned) return { ok: false, error: outcome.reason };
       return { ok: true, status: buildStatus(instance) };
     }
@@ -196,8 +209,8 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
       return { ok: true, status: buildStatus(instance) };
     case 'unresolvedResults':
       return { ok: true, results: instance.unresolvedResults() };
-    case 'classifyResult':
-      return { ok: true, comparison: instance.classifyResult(command.document) };
+    case 'classifyResults':
+      return { ok: true, comparisons: instance.classifyResults(command.document) };
     case 'recordFileResult':
       await instance.recordFileResult(command.document);
       return { ok: true };

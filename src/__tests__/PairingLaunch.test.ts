@@ -1,5 +1,10 @@
 import { expect, test } from 'vitest';
-import { buildPairingLaunchUrl, normalizeScoresheetUrl, pairingLaunchVersion } from '../qbtcp/PairingLaunch';
+import {
+  buildPairingLaunchUrl,
+  isValidServerBaseUrl,
+  normalizeScoresheetUrl,
+  pairingLaunchVersion,
+} from '../qbtcp/PairingLaunch';
 
 test('builds the v1 launch shape and omits an absent room id', () => {
   const launch = buildPairingLaunchUrl({
@@ -17,14 +22,29 @@ test('builds the v1 launch shape and omits an absent room id', () => {
 test('percent-encodes the server and includes a room id when supplied', () => {
   const launch = buildPairingLaunchUrl({
     scoresheetUrl: 'https://scores.example/hosted?tenant=abc',
-    serverBaseUrl: 'https://control.example/base?q=one&other=two',
+    serverBaseUrl: 'https://control.example/base',
     pairingCode: '87654321',
     roomId: 'room A/1',
   });
 
   expect(launch).toBe(
-    'https://scores.example/hosted?tenant=abc#qbtcp-pair?v=1&server=https%3A%2F%2Fcontrol.example%2Fbase%3Fq%3Done%26other%3Dtwo&code=87654321&room=room+A%2F1',
+    'https://scores.example/hosted?tenant=abc#qbtcp-pair?v=1&server=https%3A%2F%2Fcontrol.example%2Fbase&code=87654321&room=room+A%2F1',
   );
+});
+
+test('refuses a server address QBSheet would not accept as a base URL', () => {
+  // A base address is a host to append protocol paths to. QBSheet rejects a query or a fragment on
+  // one, so a QR code carrying either is a code this application printed and its own client refuses.
+  expect(isValidServerBaseUrl('http://192.0.2.10:40787')).toBe(true);
+  expect(isValidServerBaseUrl('https://control.example/base')).toBe(true);
+  expect(isValidServerBaseUrl('https://control.example/base?q=one')).toBe(false);
+  expect(isValidServerBaseUrl('https://control.example/base#state')).toBe(false);
+
+  for (const serverBaseUrl of ['https://control.example/base?q=one', 'https://control.example/base#state']) {
+    expect(() =>
+      buildPairingLaunchUrl({ scoresheetUrl: 'https://qbsheet.com/', serverBaseUrl, pairingCode: '12345678' }),
+    ).toThrow();
+  }
 });
 
 test('preserves the scoresheet base path and query while replacing its fragment', () => {

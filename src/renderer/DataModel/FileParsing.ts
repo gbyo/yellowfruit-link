@@ -225,8 +225,11 @@ export default class FileParser {
 
   parseScoringRulesAnswerTypes(sourceQbj: IQbjScoringRules, yftScoringRules: ScoringRules) {
     const yftAnswerTypes: AnswerType[] = [];
+    // Whether this format has bonuses at all, read the same way the bonus settings below read it.
+    // It decides whether "this answer awards no bonus" is a statement YellowFruit can honour.
+    const usesBonuses = sourceQbj.maximumBonusScore !== undefined;
     for (const aType of sourceQbj.answerTypes) {
-      const oneYftAType = this.parseAnswerType(aType as IIndeterminateQbj);
+      const oneYftAType = this.parseAnswerType(aType as IIndeterminateQbj, usesBonuses);
       if (oneYftAType !== null) yftAnswerTypes.push(oneYftAType);
     }
 
@@ -322,13 +325,15 @@ export default class FileParser {
     const { lightningDivisor } = sourceQbj;
     if (lightningDivisor === undefined) return;
 
-    if (badInteger(lightningDivisor, 0, 1000)) {
+    // Lower bound of one, like every other divisor here: zero divides nothing, and a score "always
+    // evenly divisible by zero" is not a statement the rest of the application can act on.
+    if (badInteger(lightningDivisor, 1, 1000)) {
       throw new Error(`Scoring Rules: Invalid lightning round divisor setting: ${lightningDivisor}`);
     }
     yftScoringRules.lightningDivisor = lightningDivisor;
   }
 
-  parseAnswerType(obj: IIndeterminateQbj): AnswerType | null {
+  parseAnswerType(obj: IIndeterminateQbj, usesBonuses = false): AnswerType | null {
     const baseObj = getBaseQbjObject(obj, this.refTargets);
     if (baseObj === null) return null;
 
@@ -343,6 +348,15 @@ export default class FileParser {
     // unsupported formats
     if (ptValue <= 0 && qbjAType.awardsBonus) {
       throw new Error(`Answer Types with non-positive point values may not award bonuses.`);
+    }
+    // The mirror of the rule above. YellowFruit's model says a bonus follows any positive toss-up
+    // answer, and there is nowhere to record an exception. Accepting the file and quietly ignoring
+    // the exception would score the tournament under rules nobody chose, and would then publish
+    // `awards_bonus: true` back to a scoresheet - so this is refused rather than reinterpreted.
+    if (usesBonuses && ptValue > 0 && qbjAType.awardsBonus === false) {
+      throw new Error(
+        `YellowFruit doesn't support formats where a toss-up worth ${ptValue} points does not award a bonus.`,
+      );
     }
 
     const yftAType = new AnswerType(ptValue);
@@ -547,8 +561,11 @@ export default class FileParser {
     const phaseType = yfExtraData ? yfExtraData.phaseType : assumedPhaseType;
     const rounds = this.parsePhaseRounds(qbjPhase, fallbackRoundStart);
     const code = yfExtraData ? yfExtraData.code : fallbackCode;
-    const firstRound = rounds[0].number;
-    const lastRound = rounds[rounds.length - 1].number;
+    // A Phase is allowed to list no rounds at all - a playoff stage whose schedule has not been
+    // written yet is the ordinary case. YellowFruit's Phase still needs a range, so it gets the one
+    // round it would have started at rather than reading off the end of an empty list.
+    const firstRound = rounds.length > 0 ? rounds[0].number : fallbackRoundStart;
+    const lastRound = rounds.length > 0 ? rounds[rounds.length - 1].number : fallbackRoundStart;
 
     const yftPhase = new Phase(phaseType, firstRound, lastRound, code, name);
     yftPhase.description = description || '';
@@ -684,13 +701,14 @@ export default class FileParser {
     const qbjRound = baseObj as IQbjRound;
     const yfExtraData = (baseObj as IYftFileRound).YfData;
 
-    const roundNumber = yfExtraData ? yfExtraData.number : parseFloat(qbjRound.name);
-    if (Number.isNaN(roundNumber)) {
-      const yftRound = new Round(fallbackRoundNo);
-      yftRound.name = qbjRound.name;
-      return yftRound;
-    }
-    const yftRound = new Round(roundNumber);
+    const roundNumber = yfExtraData ? yfExtraData.number : roundNumberFromName(qbjRound.name);
+    // A round called "Final" or "Tiebreaker" is ordered by its position in the file rather than by
+    // its name. It is still a round with games in it, so parsing continues from here rather than
+    // returning - an early return used to leave every such round empty.
+    const isNonNumeric = Number.isNaN(roundNumber);
+    const yftRound = new Round(isNonNumeric ? fallbackRoundNo : roundNumber);
+    if (isNonNumeric) yftRound.name = qbjRound.name;
+
     const packetFromFile = this.parseRoundPacket(qbjRound);
     if (packetFromFile) yftRound.packet = packetFromFile;
 
@@ -741,7 +759,15 @@ export default class FileParser {
       yfMatch.tryToSetId(qbjMatch.id);
     }
     yfMatch.tossupsRead = qbjMatch.tossupsRead;
-    if (yfMatch.tossupsRead === undefined && !this.tourn.scoringRules.timed) {
+    // An untimed game that does not say how many tossups it heard heard the regulation count -
+    // but only if it was played at all. A scheduled game carries no scoring content, and that
+    // absence is the only signal an importer has that it is a pairing rather than a result. Filling
+    // in twenty tossups would turn every unplayed game in a schedule into a played one.
+    if (
+      yfMatch.tossupsRead === undefined &&
+      !this.tourn.scoringRules.timed &&
+      qbjMatchHasScoringContent(qbjMatch as unknown as Record<string, unknown>)
+    ) {
       yfMatch.tossupsRead = this.tourn.scoringRules.regulationTossupCount;
     }
     if (!this.importPhase) {
@@ -962,6 +988,9 @@ export default class FileParser {
 
   /** Get the phase pointers. Later we'll hook the match object up with the real Phase objects once we have them. */
   parseMatchCarryoverPhasesStart(ary: IIndeterminateQbj[]): IQbjRefPointer[] {
+    // The field is optional in QBJ, and YellowFruit's own writer always emits it - so a file that
+    // legitimately omits it is exactly the third-party file this branch exists to read.
+    if (!Array.isArray(ary)) return [];
     const carryoverPhasesIds: IQbjRefPointer[] = [];
     for (const obj of ary) {
       // Require phases here to be ref pointers. It's very silly to define phases within objects that are themselves contained within phases.
@@ -1229,6 +1258,43 @@ export function parsePlayerYear(yearFromFile: number | undefined): string | unde
 }
 
 /** Returns true if suppliedValue isn't an integer between the given bounds */
+/**
+ * Whether a QBJ Match says anything about what happened in a game.
+ *
+ * Anything that only a played game can carry counts: a score, players who took the floor, a forfeit,
+ * or question-by-question data. A Match that names two teams and stops is a pairing.
+ */
+function qbjMatchHasScoringContent(qbjMatch: Record<string, unknown>): boolean {
+  if (Array.isArray(qbjMatch.matchQuestions) && qbjMatch.matchQuestions.length > 0) return true;
+  if (qbjMatch.overtimeTossupsRead !== undefined) return true;
+  const matchTeams = Array.isArray(qbjMatch.matchTeams) ? qbjMatch.matchTeams : [];
+  return matchTeams.some((entry) => {
+    if (typeof entry !== 'object' || entry === null) return false;
+    const matchTeam = entry as Record<string, unknown>;
+    if (matchTeam.points !== undefined) return true;
+    if (matchTeam.bonusPoints !== undefined) return true;
+    if (matchTeam.bonusBouncebackPoints !== undefined) return true;
+    if (matchTeam.lightningPoints !== undefined) return true;
+    if (matchTeam.forfeitLoss) return true;
+    return Array.isArray(matchTeam.matchPlayers) && matchTeam.matchPlayers.length > 0;
+  });
+}
+
+/**
+ * The number a round name stands for, or undefined when the name is not a number.
+ *
+ * The whole name has to be one. `parseFloat`/`parseInt` read "3A" as 3, and a game filed into round
+ * 3 because its round was called "3A" is a game in the wrong round - which is worse than a round
+ * this application treats as non-numeric and names verbatim. Fractional values are deliberately
+ * allowed: tiebreaker and finals rounds are ordered with them.
+ */
+export function roundNumberFromName(name: unknown): number {
+  const text = typeof name === 'string' ? name.trim() : name;
+  if (text === '' || text === null || text === undefined) return NaN;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
 function badInteger(suppliedValue: number, lowerBound: number, upperBound: number) {
   if (suppliedValue < lowerBound || suppliedValue > upperBound) return true;
   return suppliedValue % 1 > 0;

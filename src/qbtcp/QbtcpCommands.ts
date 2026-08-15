@@ -39,6 +39,14 @@ export type QbtcpCommand =
       rightTeamName: string;
       matchId: string;
       document: object;
+      /**
+       * The revision the document about to be served declares.
+       *
+       * The server refuses the command when its own next revision would differ. Two assignments
+       * issued from one stale view of the page would otherwise both claim the same revision while
+       * the stored record moved on twice, and a correctly scored result would be refused as stale.
+       */
+      roundRevision: number;
     }
   | { kind: 'clearAssignment'; roomId: string }
   /** Record what the director decided about a received result. */
@@ -46,13 +54,15 @@ export type QbtcpCommand =
   /** Results still awaiting a decision, so a restart can re-offer them. */
   | { kind: 'unresolvedResults' }
   /**
-   * Ask whether a document is already on record, without recording it.
+   * Ask how each game in a document stands against what is already on record, without recording it.
    *
    * Read-only on purpose. The manual import path classifies a file while building its review list,
    * and the director may still cancel that import - recording at that moment would leave a result on
    * record that was never turned into a match.
+   *
+   * One answer per `Match`, in document order, because a file can hold a whole day of games.
    */
-  | { kind: 'classifyResult'; document: object }
+  | { kind: 'classifyResults'; document: object }
   /** Record a result that came in as a file, once the director has committed the import. */
   | { kind: 'recordFileResult'; document: object }
   /** Whether unresolved scored work would be destroyed by switching tournaments. */
@@ -72,7 +82,7 @@ export type QbtcpCommandResult =
   | { ok: true; status: IQbtcpServerStatus }
   | { ok: true; results: IReceivedResult[] }
   | { ok: true; hasActiveWork: boolean }
-  | { ok: true; comparison: ResultComparison }
+  | { ok: true; comparisons: ResultComparison[] }
   | { ok: true; exported: boolean }
   | { ok: true }
   /** `error` is always safe to show a director, and never contains a credential. */
