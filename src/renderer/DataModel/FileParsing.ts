@@ -707,12 +707,12 @@ export default class FileParser {
     // returning - an early return used to leave every such round empty.
     const isNonNumeric = !Number.isFinite(roundNumber);
     const yftRound = new Round(isNonNumeric ? fallbackRoundNo : roundNumber);
-    if (isNonNumeric) yftRound.name = qbjRound.name;
+    if (isNonNumeric && typeof qbjRound.name === 'string') yftRound.name = qbjRound.name;
 
     const packetFromFile = this.parseRoundPacket(qbjRound);
     if (packetFromFile) yftRound.packet = packetFromFile;
 
-    if (yfExtraData?.nonNumericName) yftRound.name = yfExtraData.nonNumericName;
+    if (typeof yfExtraData?.nonNumericName === 'string') yftRound.name = yfExtraData.nonNumericName;
     yftRound.matches = this.parseRoundMatches(qbjRound);
     return yftRound;
   }
@@ -1026,7 +1026,7 @@ export default class FileParser {
     return yfMatchQuestions;
   }
 
-  parseMatchQuestion(obj: IIndeterminateQbj): MatchQuestion | null {
+  parseMatchQuestion(obj: IIndeterminateQbj, teamsInMatch: Team[]): MatchQuestion | null {
     const baseObj = getBaseQbjObject(obj, this.refTargets);
     if (baseObj === null) return null;
 

@@ -117,6 +117,26 @@ test('finds inline matches under top-level Round objects', () => {
   expect(findResultMatchList(document)).toEqual([inline]);
 });
 
+test('deduplicates distinct Match objects that carry the same stable identity', () => {
+  const first = {
+    type: 'Match',
+    id: 'Match_same',
+    match_teams: [{ team: { $ref: 'Team_left' } }, { team: { $ref: 'Team_right' } }],
+  };
+  const duplicateTopLevel = { ...first };
+  const duplicateInline = { ...first };
+  const document = {
+    version: '2.1.1',
+    objects: [
+      first,
+      duplicateTopLevel,
+      { type: 'Round', name: '4', matches: [duplicateInline, { $ref: 'Match_same' }] },
+    ],
+  };
+
+  expect(findResultMatchList(document)).toEqual([first]);
+});
+
 test('a multi-game file is classified and recorded one game at a time', async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-multi-'));
   try {

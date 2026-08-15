@@ -78,6 +78,7 @@ export default class RoomsManager {
     const requestId = background ? 0 : ++this.nextRequestId;
     const pollId = background ? ++this.nextPollId : 0;
     const foregroundRequestIdAtDispatch = this.nextRequestId;
+    const foregroundWasInFlightAtDispatch = this.inFlight > 0;
     if (!background) {
       this.inFlight += 1;
       this.busy = true;
@@ -97,11 +98,13 @@ export default class RoomsManager {
       }
       if (background) {
         // A poll only fills in the quiet moments. It never lands on top of a command's outcome, an
-        // older poll, or a foreground request that began after this poll was dispatched.
+        // older poll, a foreground request that was already active when this poll was dispatched, or
+        // one that began later.
         if (
           reply.ok &&
           'status' in reply &&
           this.inFlight === 0 &&
+          !foregroundWasInFlightAtDispatch &&
           pollId === this.nextPollId &&
           foregroundRequestIdAtDispatch === this.nextRequestId
         ) {

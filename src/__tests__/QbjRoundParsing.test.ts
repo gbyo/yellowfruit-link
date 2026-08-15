@@ -75,6 +75,28 @@ test('a YFT round missing its stored number falls back to file order', () => {
   expect(round?.name).toBe('Final');
 });
 
+test('non-string round names are not stored in the Round model', () => {
+  const { parser } = parserFor();
+  const malformedName = parser.parseRound(
+    { type: 'Round', name: true, matches: [] } as unknown as IIndeterminateQbj,
+    6,
+  );
+  const malformedYftName = parser.parseRound(
+    {
+      type: 'Round',
+      name: '4',
+      YfData: { number: 4, nonNumericName: [5] },
+      matches: [],
+    } as unknown as IIndeterminateQbj,
+    6,
+  );
+
+  expect(malformedName?.number).toBe(6);
+  expect(malformedName?.name).toBe('6');
+  expect(malformedYftName?.number).toBe(4);
+  expect(malformedYftName?.name).toBe('4');
+});
+
 test('a round named with a numeric prefix is not treated as that number', () => {
   const { parser } = parserFor();
   const round = parser.parseRound({ type: 'Round', name: '3A', matches: [] } as unknown as IIndeterminateQbj, 9);
