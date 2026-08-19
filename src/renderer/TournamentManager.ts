@@ -42,6 +42,9 @@ import parseTeamsFromSqbsFile from './DataModel/SqbsParsing';
 import SqbsExportModalManager from './Modal Managers/SqbsExportModalManager';
 import SqbsGenerator from './DataModel/SqbsFileGeneration';
 import RoomsManager from './Modal Managers/RoomsManager';
+import ScheduledGameManager from './Modal Managers/ScheduledGameManager';
+import { ScheduledGame } from './DataModel/ScheduledGame';
+import { PairingGenerationMode, scheduledGameLockReason } from './DataModel/PairingGeneration';
 import { IReceivedResult } from '../qbtcp/QbtcpState';
 import { QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
 import { ResultComparison, readResultIdentities, readResultIdentity } from '../qbtcp/ResultFingerprint';
@@ -100,6 +103,9 @@ export class TournamentManager {
 
   matchImportResultsManager: MatchImportResultsManager;
 
+  /** The add/edit workflow for one scheduled pairing on the Schedule page. */
+  scheduledGameManager: ScheduledGameManager;
+
   sqbsExportModalManager: SqbsExportModalManager;
 
   aboutYfDialogOpen: boolean = false;
@@ -153,6 +159,7 @@ export class TournamentManager {
     this.rankModalManager = new TempRankManager();
     this.poolAssignmentModalManager = new PoolAssignmentModalManager();
     this.matchImportResultsManager = new MatchImportResultsManager();
+    this.scheduledGameManager = new ScheduledGameManager();
     this.sqbsExportModalManager = new SqbsExportModalManager();
     this.roomsManager = new RoomsManager();
     this.roomsManager.getTournament = () => this.tournament;
@@ -766,7 +773,31 @@ export class TournamentManager {
     if (yfMatch) {
       Tournament.validateHaveTeamsPlayedInRound(yfMatch, round, phase, false);
       importResult.evaluateMatch(yfMatch);
+      TournamentManager.refuseIfScheduledGameAlreadyPlayed(yfMatch, round, importResult);
     }
+  }
+
+  /**
+   * Refuse a result for a scheduled game that has already been recorded.
+   *
+   * The Rooms adapter's duplicate detection normally answers this first, by fingerprint, and it is the
+   * better answer because it can tell a retry from a disagreement. But it only speaks for tournaments
+   * it is bound to, and a director importing the file a scorekeeper carried over on a memory stick,
+   * with the server stopped, gets no answer from it at all. The pairing's own identity is enough to
+   * know that this game is on record, so it is checked here too - one pairing, one game.
+   */
+  private static refuseIfScheduledGameAlreadyPlayed(match: Match, round: Round, importResult: MatchImportResult) {
+    const { scheduledGameId } = match;
+    if (!scheduledGameId) return;
+    const scheduledGame = round.findScheduledGameById(scheduledGameId);
+    if (!scheduledGame) return;
+    const existing = round.getMatchForScheduledGame(scheduledGame);
+    if (!existing) return;
+
+    importResult.markFatal(
+      `A game for this scheduled pairing (${scheduledGame.displayName()}) is already recorded in ${round.displayName()}. No second game will be added.`,
+    );
+    importResult.proceedWithImport = false;
   }
 
   /** Save the tournament to the given file and switch context to that file */
@@ -937,6 +968,10 @@ export class TournamentManager {
     this.teamModalManager.tournament = this.tournament;
     this.matchModalManager.tournament = this.tournament;
     this.tournament.onTournamentIdCreated = () => this.markFileDirty();
+    // Pairing generation has to be able to refuse to disturb a game a room is scoring. That state
+    // belongs to the Rooms adapter rather than to the tournament, so it reaches the data model as a
+    // question the tournament asks rather than as data it holds.
+    this.tournament.scheduledGameIsBusy = (game: ScheduledGame) => this.roomsManager.scheduledGameBusyReason(game.id);
     // Point the Rooms adapter at whatever tournament is now open. Every path that replaces the
     // tournament comes through here, so this is the one place that has to know.
     this.roomsManager
@@ -1254,6 +1289,90 @@ export class TournamentManager {
     this.poolModalManager.closeModal(false);
     phase.deletePool(pool, true);
     this.onDataChanged();
+  }
+
+  // --- scheduled games -------------------------------------------------------------------------
+
+  /** Why this pairing must be left alone right now, or undefined if it can be edited. */
+  scheduledGameLockReason(game: ScheduledGame, round: Round) {
+    return scheduledGameLockReason(game, round, this.tournament.scheduledGameIsBusy);
+  }
+
+  openScheduledGameModal(phase: Phase, round: Round, game?: ScheduledGame) {
+    if (game) {
+      const lockReason = this.scheduledGameLockReason(game, round);
+      if (lockReason) {
+        this.makeToast(`This pairing can't be changed: ${lockReason}.`, 'warning');
+        return;
+      }
+    }
+    this.scheduledGameManager.openModal(phase, round, this.eligibleTeamsForPhase(phase), game);
+    this.onDataChanged(true);
+  }
+
+  closeScheduledGameModal(shouldSave: boolean) {
+    const closed = this.scheduledGameManager.closeModal(shouldSave);
+    if (!closed) return;
+    this.onDataChanged(!shouldSave);
+  }
+
+  tryDeleteScheduledGame(round: Round, game: ScheduledGame) {
+    const lockReason = this.scheduledGameLockReason(game, round);
+    if (lockReason) {
+      this.makeToast(`This pairing can't be deleted: ${lockReason}.`, 'warning');
+      return;
+    }
+    this.genericModalManager.open(
+      'Delete Pairing',
+      `Are you sure you want to delete ${game.displayName()} from ${round.displayName()}?`,
+      'N&o',
+      '&Yes',
+      () => this.deleteScheduledGame(round, game),
+    );
+  }
+
+  deleteScheduledGame(round: Round, game: ScheduledGame) {
+    round.deleteScheduledGame(game);
+    this.onDataChanged();
+  }
+
+  /**
+   * Generate a phase's round-robin pairings at the director's request.
+   *
+   * Confirmed first when the phase already has pairings, because this is the one path allowed to
+   * replace a schedule somebody wrote by hand. Games that are live or already played still block
+   * their pool - that is not a decision the confirmation can override, and the outcome says so.
+   */
+  tryGeneratePairings(phase: Phase) {
+    if (!phase.anyScheduledGamesExist()) {
+      this.generatePairings(phase);
+      return;
+    }
+    this.genericModalManager.open(
+      'Generate Pairings',
+      `${phase.name} already has pairings. Generating will replace them with a fresh round robin for each pool. Pairings that are assigned to a room or have already been played will be left alone.`,
+      'N&o',
+      '&Yes',
+      () => this.generatePairings(phase),
+    );
+  }
+
+  private generatePairings(phase: Phase) {
+    const outcome = this.tournament.generatePairingsForOnePhase(phase, PairingGenerationMode.ReplaceAll);
+    this.onDataChanged();
+
+    if (outcome.skipped.length > 0) {
+      this.openGenericModal('Generate Pairings', `${describePairingOutcome(outcome)}\n\n${outcome.skipped.join('\n')}`);
+      return;
+    }
+    this.makeToast(describePairingOutcome(outcome));
+  }
+
+  /** The teams the pairing editor may choose from for this phase: its pools' teams, then the rest. */
+  private eligibleTeamsForPhase(phase: Phase): Team[] {
+    const inPools = phase.pools.map((pool) => pool.poolTeams.map((pt) => pt.team)).flat();
+    const others = this.tournament.getListOfAllTeams().filter((team) => !inPools.includes(team));
+    return inPools.concat(others);
   }
 
   tryDeleteTeam(reg: Registration, team: Team) {
@@ -1890,6 +2009,14 @@ class NullTournamentManager extends TournamentManager {
 
   // eslint-disable-next-line class-methods-use-this
   setFilePath(): void {}
+}
+
+/** A sentence describing what a pairing generation run did. */
+function describePairingOutcome(outcome: { gamesCreated: number; gamesRemoved: number }): string {
+  if (outcome.gamesCreated === 0 && outcome.gamesRemoved === 0) return 'No pairings were generated.';
+  const created = `${outcome.gamesCreated} pairing${outcome.gamesCreated === 1 ? '' : 's'} generated`;
+  if (outcome.gamesRemoved === 0) return `${created}.`;
+  return `${created}, replacing ${outcome.gamesRemoved}.`;
 }
 
 /** A parse with nothing applied to it - no date reviver, no case conversion. */

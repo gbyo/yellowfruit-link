@@ -16,6 +16,7 @@ import {
   TextField,
   Skeleton,
   Button,
+  Chip,
 } from '@mui/material';
 import Grid from '@mui/material/Unstable_Grid2';
 import React, { useContext, useMemo, useState } from 'react';
@@ -26,6 +27,7 @@ import YfCard from './YfCard';
 import { Match } from '../DataModel/Match';
 import { Phase } from '../DataModel/Phase';
 import { Round } from '../DataModel/Round';
+import { ScheduledGame } from '../DataModel/ScheduledGame';
 import GamesViewByPool from './GamesPagePoolView';
 import { ValidationStatuses } from '../DataModel/Interfaces';
 import { Team } from '../DataModel/Team';
@@ -197,9 +199,22 @@ function SingleRound(props: ISingleRoundProps) {
     [filterTeam, round.matches],
   );
   const numMatches = matchesToShow.length;
+  // Pairings that have not been played yet. Shown separately and labelled, never mixed into the game
+  // count: `numMatches` is the number of games that have actually been entered in this round, and
+  // everything on this page that says "game" means one of those.
+  const scheduledToShow = useMemo(
+    () =>
+      round.scheduledGames.filter(
+        (sg) => !round.scheduledGameIsComplete(sg) && (!filterTeam || sg.includesTeam(filterTeam)),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterTeam, round.scheduledGames, round.matches],
+  );
 
   if (prevFilterTeam !== filterTeam) {
-    if (filterTeam && numMatches > 0) setExpanded(true);
+    // Scheduled games count towards opening the round: filtering by a team is asking "what does this
+    // team have here", and what they have left to play is part of the answer.
+    if (filterTeam && numMatches + scheduledToShow.length > 0) setExpanded(true);
     else setExpanded(false);
     setPrevFilterTeam(filterTeam);
   }
@@ -225,6 +240,7 @@ function SingleRound(props: ISingleRoundProps) {
         <Typography sx={{ width: '33%', flexShrink: 0 }}>{round.displayName(forceNumericDisplay)}</Typography>
         <Typography sx={{ width: '34%', color: 'text.secondary' }}>
           {numMatches === 1 ? '1 game' : `${numMatches} games`}
+          {scheduledToShow.length > 0 && ` \u00b7 ${scheduledToShow.length} scheduled`}
           {!!filterTeam && <FilterAlt fontSize="small" sx={{ verticalAlign: 'sub' }} />}
         </Typography>
         <Typography sx={{ width: '28%' }}>
@@ -280,9 +296,12 @@ function SingleRound(props: ISingleRoundProps) {
       </AccordionSummary>
       <AccordionDetails>
         {expanded ? (
-          <SingleRoundMatchList round={round} matchList={matchesToShow} />
+          <>
+            <SingleRoundMatchList round={round} matchList={matchesToShow} />
+            <ScheduledGameList scheduledGames={scheduledToShow} />
+          </>
         ) : (
-          <PlaceholderMatchList listSize={Math.min(matchesToShow.length, 6)} />
+          <PlaceholderMatchList listSize={Math.min(matchesToShow.length + scheduledToShow.length, 6)} />
         )}
       </AccordionDetails>
     </Accordion>
@@ -307,6 +326,45 @@ function SingleRoundMatchList(props: ISingleRoundMatchListProps) {
         ))}
       </Box>
     )
+  );
+}
+
+interface IScheduledGameListProps {
+  scheduledGames: ScheduledGame[];
+}
+
+/**
+ * The pairings in this round that nobody has entered a game for yet.
+ *
+ * Read-only and clearly marked. They are here because "what is left to play in this round" is the
+ * question a director asks of this page during a tournament, and they are visually separate from the
+ * matches above because a pairing is not a result - it has no score, no validation state and no
+ * effect on the standings. The pairings themselves are edited on the Schedule page.
+ */
+function ScheduledGameList(props: IScheduledGameListProps) {
+  const { scheduledGames } = props;
+  if (scheduledGames.length === 0) return null;
+
+  return (
+    <Box sx={{ mt: 1, border: 1, borderRadius: 1, borderColor: 'lightgray', borderStyle: 'dashed' }}>
+      {scheduledGames.map((game, idx) => (
+        <div key={game.id}>
+          {idx !== 0 && <Divider />}
+          <Grid container sx={{ p: 1 }}>
+            <Grid xs={8}>
+              <Typography variant="body1" color="text.secondary">
+                {game.displayName()}
+              </Typography>
+            </Grid>
+            <Grid xs={4}>
+              <Box sx={{ float: 'right' }}>
+                <Chip size="small" variant="outlined" label="Scheduled" />
+              </Box>
+            </Grid>
+          </Grid>
+        </div>
+      ))}
+    </Box>
   );
 }
 

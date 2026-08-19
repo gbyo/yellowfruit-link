@@ -19,6 +19,7 @@ import { IQbjRank } from './Rank';
 import { IQbjRanking, OverallRanking, Ranking } from './Ranking';
 import Registration, { IQbjRegistration, IYftFileRegistration } from './Registration';
 import { IQbjRound, IYftFileRound, Round, sortRounds } from './Round';
+import { IYftFileScheduledGame, ScheduledGame } from './ScheduledGame';
 import { IQbjScoringRules, IYftFileScoringRules, ScoringRules } from './ScoringRules';
 import { IQbjTeam, IYftFileTeam, Team } from './Team';
 import Tournament, { IQbjTournament, IYftFileTournament } from './Tournament';
@@ -714,7 +715,51 @@ export default class FileParser {
 
     if (yfExtraData?.nonNumericName) yftRound.name = yfExtraData.nonNumericName;
     yftRound.matches = this.parseRoundMatches(qbjRound);
+    yftRound.scheduledGames = this.parseScheduledGames(yfExtraData?.scheduledGames);
     return yftRound;
+  }
+
+  /**
+   * Read a round's scheduled pairings out of its YfData.
+   *
+   * Missing or empty is the ordinary case: every .yft written before this field existed has no such
+   * list, and a tournament whose schedule was never written has none either. Neither is an error.
+   *
+   * A pairing whose team cannot be resolved is dropped rather than thrown, because a stale team
+   * reference must not be able to stop a file opening - the games that were actually played are in
+   * this same file and matter more than a pairing that can no longer be honoured.
+   */
+  parseScheduledGames(fromFile?: IYftFileScheduledGame[]): ScheduledGame[] {
+    if (!fromFile || !Array.isArray(fromFile)) return [];
+
+    const games: ScheduledGame[] = [];
+    for (const entry of fromFile) {
+      if (!entry?.id) continue;
+      const leftTeam = this.resolveScheduledGameTeam(entry.leftTeam);
+      const rightTeam = this.resolveScheduledGameTeam(entry.rightTeam);
+      if (!leftTeam || !rightTeam || leftTeam === rightTeam) continue;
+
+      games.push(
+        new ScheduledGame(leftTeam, rightTeam, {
+          id: entry.id,
+          poolName: entry.poolName,
+          // Older or hand-edited data without the flag is treated as the director's, which is the
+          // safe direction: automatic regeneration then leaves it alone rather than replacing it.
+          generated: entry.generated ?? false,
+        }),
+      );
+    }
+    return games;
+  }
+
+  /** A scheduled game's team, by file id and then by the name that id encodes. */
+  private resolveScheduledGameTeam(ref?: IQbjRefPointer): Team | undefined {
+    if (!ref?.$ref) return undefined;
+    const byId = this.teamsById[ref.$ref];
+    if (byId) return byId;
+    // Team ids are "Team_<name>". Falling back to the name covers a pairing imported alongside a
+    // roster that was matched by name rather than by id.
+    return this.tourn.findTeamByName(ref.$ref.replace(/^Team_/, ''));
   }
 
   // We only support one packet name - arbitrarily use the first packet
@@ -804,10 +849,28 @@ export default class FileParser {
     yfMatch.modalBottomValidation = new MatchValidationCollection();
     yfMatch.modalBottomValidation.addFromFileObjects(yfExtraData?.otherValidation || []);
     yfMatch.importedFile = yfExtraData?.importedFile;
+    yfMatch.scheduledGameId = yfExtraData?.scheduledGameId ?? this.scheduledGameIdFromMatchId(qbjMatch.id);
 
     yfMatch.validateAll(this.tourn.scoringRules);
     yfMatch.determineStatsValidity();
     return yfMatch;
+  }
+
+  /**
+   * The scheduled game a result claims to be, when it claims to be one.
+   *
+   * A result that came back from a room carries the scheduled game's identity as its QBJ `Match.id`,
+   * because that is what the assignment published. `Match.tryToSetId` deliberately refuses to absorb
+   * that value into the match's own numbering, so it is read here instead and recorded as the link.
+   *
+   * The identity has to name a scheduled game that this tournament actually has. An arbitrary QBJ
+   * file whose matches happen to carry ids resolves to nothing and is imported as an ordinary game.
+   * During a whole-file open the tournament has no phases yet, so this correctly finds nothing and
+   * the link comes from YfData instead.
+   */
+  private scheduledGameIdFromMatchId(matchId?: string): string | undefined {
+    if (!matchId) return undefined;
+    return this.tourn.findScheduledGameById(matchId) ? matchId : undefined;
   }
 
   parseMatchMatchTeams(matchTeams: IIndeterminateQbj[]): MatchTeam[] {

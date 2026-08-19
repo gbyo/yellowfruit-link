@@ -29,6 +29,7 @@ import StatReportPage from './Components/StatReportPage';
 import { ApplicationPages } from './Enums';
 import PhaseEditDialog from './Components/PhaseEditDialog';
 import PoolEditDialog from './Components/PoolEditDialog';
+import ScheduledGameEditDialog from './Components/ScheduledGameEditDialog';
 import RankEditDialog from './Components/RankEditDialog';
 import { IpcRendToMain } from '../IPCChannels';
 import PoolAssignmentDialog from './Components/PoolAssignmentDialog';
@@ -121,6 +122,7 @@ function TournamentEditor() {
       <MatchEditDialog />
       <PhaseEditDialog />
       <PoolEditDialog />
+      <ScheduledGameEditDialog />
       <RankEditDialog />
       <PoolAssignmentDialog />
       <MatchImportResultDialog />

@@ -39,6 +39,7 @@ import PairingSheetsDialog from './PairingSheetsDialog';
 import { IRoomView } from '../../qbtcp/QbtcpState';
 import { isValidQbtcpPort, presenceFreshMs } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
+import { LinkButton } from '../Utils/GeneralReactUtils';
 
 /**
  * How often this page re-reads room status while it is open.
@@ -412,11 +413,18 @@ interface IAssignDialogProps {
 }
 
 /**
- * Choose a round and two teams.
+ * Choose which game this room will score.
  *
- * Reads the tournament's own rounds and teams rather than keeping a schedule of its own. This page
- * adds no scheduling concepts to YellowFruit - it only names a game that the tournament already
- * describes.
+ * The normal path is picking an already-scheduled game: the tournament knows who plays whom, and the
+ * director's job here is to say where. Selecting a pairing rather than retyping it is also what keeps
+ * the room's assignment tied to a stable identity, so the result that comes back names the pairing it
+ * was scored against instead of a game invented at the moment of assignment.
+ *
+ * Manual entry remains, one click away. Tiebreakers, oddly-shaped finals, a consolation bracket
+ * playing arbitrary matchups, a legacy tournament with no schedule written, and the moment on a
+ * tournament morning when something has to happen right now regardless of what the schedule says -
+ * all of those need a round and two teams typed in, and none of them are unusual enough to be worth
+ * making impossible.
  */
 function AssignDialog(props: IAssignDialogProps) {
   const { room, isOpen, onClose } = props;
@@ -426,64 +434,115 @@ function AssignDialog(props: IAssignDialogProps) {
 
   const allRounds: Round[] = tournament.phases.flatMap((phase) => phase.rounds);
   const teams = tournament.getListOfAllTeams();
+  const eligible = rooms.eligibleScheduledGames(tournament, room.id);
 
+  // Manual is the fallback, not the default - unless there is nothing scheduled to choose from, in
+  // which case it is the only thing this dialog can usefully offer.
+  const [manual, setManual] = useState(eligible.length === 0);
+  const [scheduledGameId, setScheduledGameId] = useState(
+    () => eligible.find((entry) => entry.game.id === room.assignment?.matchId)?.game.id ?? eligible[0]?.game.id ?? '',
+  );
   const [roundName, setRoundName] = useState(room.assignment ? String(room.assignment.roundNumber) : '');
   const [leftName, setLeftName] = useState(room.assignment?.leftTeamName ?? '');
   const [rightName, setRightName] = useState(room.assignment?.rightTeamName ?? '');
 
+  const chosenScheduled = eligible.find((entry) => entry.game.id === scheduledGameId);
   const round = allRounds.find((entry) => String(entry.number) === roundName);
   const leftTeam = teams.find((team) => team.name === leftName);
   const rightTeam = teams.find((team) => team.name === rightName);
   const sameTeam = leftName !== '' && leftName === rightName;
-  const canAssign = !!round && !!leftTeam && !!rightTeam && !sameTeam;
+  const canAssign = manual ? !!round && !!leftTeam && !!rightTeam && !sameTeam : !!chosenScheduled;
+
+  const handleAssign = () => {
+    if (manual) {
+      if (round && leftTeam && rightTeam) rooms.assign(room.id, round, leftTeam, rightTeam);
+    } else if (chosenScheduled) {
+      rooms.assignScheduledGame(room.id, chosenScheduled.round, chosenScheduled.game);
+    }
+    onClose();
+  };
 
   return (
     <Dialog open={isOpen} onClose={onClose} fullWidth maxWidth="xs">
       <DialogTitle>Assign a game to {room.name}</DialogTitle>
       <DialogContent>
         <Stack spacing={2} sx={{ mt: 1 }}>
-          {allRounds.length === 0 && (
-            <Alert severity="info">This tournament has no rounds yet. Set up the schedule first.</Alert>
+          {!manual && eligible.length === 0 && (
+            <Alert severity="info">
+              No scheduled games are available. Generate or add pairings on the Schedule page, or assign a game
+              manually.
+            </Alert>
           )}
-          <TextField select size="small" label="Round" value={roundName} onChange={(e) => setRoundName(e.target.value)}>
-            {allRounds.map((entry) => (
-              <MenuItem key={entry.name} value={String(entry.number)}>
-                {entry.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          <TextField select size="small" label="Team A" value={leftName} onChange={(e) => setLeftName(e.target.value)}>
-            {teams.map((team) => (
-              <MenuItem key={team.id} value={team.name}>
-                {team.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          <TextField
-            select
-            size="small"
-            label="Team B"
-            value={rightName}
-            onChange={(e) => setRightName(e.target.value)}
-          >
-            {teams.map((team) => (
-              <MenuItem key={team.id} value={team.name}>
-                {team.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          {sameTeam && <Alert severity="warning">A team cannot play itself.</Alert>}
+          {!manual && eligible.length > 0 && (
+            <TextField
+              select
+              size="small"
+              label="Scheduled game"
+              value={scheduledGameId}
+              onChange={(e) => setScheduledGameId(e.target.value)}
+            >
+              {eligible.map((entry) => (
+                <MenuItem key={entry.game.id} value={entry.game.id}>
+                  {`${entry.round.displayName()} \u00b7 ${entry.game.displayName()}`}
+                </MenuItem>
+              ))}
+            </TextField>
+          )}
+          {manual && (
+            <>
+              {allRounds.length === 0 && (
+                <Alert severity="info">This tournament has no rounds yet. Set up the schedule first.</Alert>
+              )}
+              <TextField
+                select
+                size="small"
+                label="Round"
+                value={roundName}
+                onChange={(e) => setRoundName(e.target.value)}
+              >
+                {allRounds.map((entry) => (
+                  <MenuItem key={entry.name} value={String(entry.number)}>
+                    {entry.name}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <TextField
+                select
+                size="small"
+                label="Team A"
+                value={leftName}
+                onChange={(e) => setLeftName(e.target.value)}
+              >
+                {teams.map((team) => (
+                  <MenuItem key={team.id} value={team.name}>
+                    {team.name}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <TextField
+                select
+                size="small"
+                label="Team B"
+                value={rightName}
+                onChange={(e) => setRightName(e.target.value)}
+              >
+                {teams.map((team) => (
+                  <MenuItem key={team.id} value={team.name}>
+                    {team.name}
+                  </MenuItem>
+                ))}
+              </TextField>
+              {sameTeam && <Alert severity="warning">A team cannot play itself.</Alert>}
+            </>
+          )}
+          <LinkButton sx={{ alignSelf: 'flex-start' }} onClick={() => setManual(!manual)}>
+            {manual ? 'Choose a scheduled game instead' : 'Manual assignment'}
+          </LinkButton>
         </Stack>
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Cancel</Button>
-        <Button
-          disabled={!canAssign}
-          onClick={() => {
-            if (round && leftTeam && rightTeam) rooms.assign(room.id, round, leftTeam, rightTeam);
-            onClose();
-          }}
-        >
+        <Button disabled={!canAssign} onClick={handleAssign}>
           Assign
         </Button>
       </DialogActions>

@@ -23,6 +23,7 @@ import { defaultScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import { makeOpaqueId } from '../../SharedUtils';
 import { assignmentFileName, buildAssignmentDocument } from '../DataModel/QbjAssignment';
 import { Round } from '../DataModel/Round';
+import { ScheduledGame } from '../DataModel/ScheduledGame';
 import { Team } from '../DataModel/Team';
 import Tournament from '../DataModel/Tournament';
 
@@ -31,6 +32,12 @@ function emptyStatus(): IQbtcpServerStatus {
 }
 
 function noop(): void {}
+
+/** A scheduled game that could be sent to a room, with the round holding it. */
+export interface IEligibleScheduledGame {
+  round: Round;
+  game: ScheduledGame;
+}
 
 /** Placeholder so the manager is usable before TournamentManager wires the real accessor. */
 function newEmptyTournament(): Tournament {
@@ -177,13 +184,86 @@ export default class RoomsManager {
   }
 
   /**
+   * Why this scheduled game cannot be assigned right now, or undefined if it can.
+   *
+   * Read from the room status the main process reported, which is the only place this state exists -
+   * a room, its session and the results it has sent are operational facts about how a tournament is
+   * being run, not part of the tournament's record, and they are persisted separately for that reason.
+   *
+   * A scheduled game already in the room being assigned is not busy from that room's point of view;
+   * that is the "Change" case, and the row's own lock decides whether it is allowed.
+   */
+  scheduledGameBusyReason(scheduledGameId: string, exceptRoomId?: string): string | undefined {
+    for (const room of this.status.rooms) {
+      if (room.assignment?.matchId !== scheduledGameId) continue;
+      if (room.id === exceptRoomId) continue;
+      if (room.result?.status === 'needs-review' || room.result?.status === 'conflict') {
+        return `${room.name} has a result waiting for review`;
+      }
+      return `it is assigned to ${room.name}`;
+    }
+    return undefined;
+  }
+
+  /**
+   * The scheduled games this room could be given, earliest round first.
+   *
+   * This filtering is the substance of the scheduled-game workflow, so it lives here rather than in
+   * the page: a director choosing from this list must not be able to take a game away from another
+   * room, re-send one that has already been played, or displace a result nobody has reviewed. Each
+   * exclusion corresponds to a state that exists for a reason:
+   *
+   *   - played: an entered Match already references the pairing, so its identity is part of the
+   *     tournament's record;
+   *   - in another room: that room is either serving it or scoring it right now;
+   *   - awaiting review: the pairing has to stay where it is until the director decides what the
+   *     result was, or the review ends up pointing at a game the room is no longer playing.
+   *
+   * The pairing currently in *this* room is still listed, so "Change" can show what the room has and
+   * a director can put it back after looking at the alternatives.
+   */
+  eligibleScheduledGames(tournament: Tournament, roomId: string): IEligibleScheduledGame[] {
+    const eligible: IEligibleScheduledGame[] = [];
+    for (const phase of tournament.phases) {
+      for (const round of phase.rounds) {
+        for (const game of round.scheduledGames) {
+          if (round.scheduledGameIsComplete(game)) continue;
+          if (this.scheduledGameBusyReason(game.id, roomId)) continue;
+          eligible.push({ round, game });
+        }
+      }
+    }
+    // Ascending by round, so the game offered by default is the next one to be played rather than
+    // whichever phase happens to come first in the file.
+    eligible.sort((a, b) => a.round.number - b.round.number);
+    return eligible;
+  }
+
+  /**
+   * Assign an already-scheduled game to a room.
+   *
+   * The normal path. The scheduled game's own identity is published as the assignment's `matchId`,
+   * so the result that comes back names the pairing it was scored against rather than a game invented
+   * at the moment of assignment. Sending the same scheduled game to a room twice - after a network
+   * drop, say - therefore refers to the same game both times, which is what lets the server recognise
+   * a retry instead of recording a second one.
+   */
+  async assignScheduledGame(roomId: string, round: Round, game: ScheduledGame): Promise<void> {
+    await this.assign(roomId, round, game.leftTeam, game.rightTeam, game.id);
+  }
+
+  /**
    * Assign a game to a room.
    *
    * The QBJ document is built here, by the one shared builder, and handed to the main process to serve
-   * verbatim. A fresh `matchId` is minted per assignment: a different pairing in the same room is a
-   * different game, and reusing the identifier would make two games indistinguishable on the way back.
+   * verbatim.
+   *
+   * `matchId` is the scheduled game's identity when there is one. Without it - a tiebreaker, an
+   * unusual final, a pool that plays arbitrary matchups, or a tournament with no schedule written -
+   * a fresh opaque id is minted, because a manually paired game has no prior identity to reuse and
+   * two such games must not be indistinguishable on the way back.
    */
-  async assign(roomId: string, round: Round, leftTeam: Team, rightTeam: Team): Promise<void> {
+  async assign(roomId: string, round: Round, leftTeam: Team, rightTeam: Team, matchId?: string): Promise<void> {
     const tournament = this.getTournament();
     const phase = tournament.findPhaseByRound(round);
     if (!phase) {
@@ -198,7 +278,7 @@ export default class RoomsManager {
       return;
     }
 
-    const matchId = makeOpaqueId('Match_', 8);
+    const idToPublish = matchId ?? makeOpaqueId('Match_', 8);
     // The server increments its own revision; this is the value published in the document for the
     // assignment about to replace whatever the room had. It is sent along with the command so the
     // server can refuse a command issued from a page that had already gone out of date, rather than
@@ -210,7 +290,7 @@ export default class RoomsManager {
       round,
       leftTeam,
       rightTeam,
-      matchId,
+      matchId: idToPublish,
       roomName: room.name,
       roomId: room.id,
       roundRevision,
@@ -224,7 +304,7 @@ export default class RoomsManager {
       rightTeamId: rightTeam.id,
       leftTeamName: leftTeam.name,
       rightTeamName: rightTeam.name,
-      matchId,
+      matchId: idToPublish,
       document,
       roundRevision,
     });

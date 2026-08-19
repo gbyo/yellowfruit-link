@@ -6,6 +6,7 @@ import { IQbjPacket, Packet } from './Packet';
 import { Phase } from './Phase';
 import { Player } from './Player';
 import { QbjTypeNames } from './QbjEnums';
+import { IYftFileScheduledGame, ScheduledGame } from './ScheduledGame';
 import { Team } from './Team';
 
 export interface IQbjRound extends IQbjObject {
@@ -28,9 +29,18 @@ export interface IYftFileRound extends IQbjRound, IYftFileObject {
 }
 
 /** Additional info not in qbj but needed for a .yft file */
-interface IRoundExtraData {
+export interface IRoundExtraData {
   number: number;
   nonNumericName?: string;
+  /**
+   * Pairings for this round that have not been played.
+   *
+   * Optional, and absent from every .yft written before this field existed - a file without it opens
+   * with an empty list, which is indistinguishable from a tournament whose schedule was never
+   * written. Deliberately here rather than in the QBJ body: a scheduled game is not a QBJ Match, and
+   * emitting it as one would make a QBJ-only export claim a day of nil-nil games was played.
+   */
+  scheduledGames?: IYftFileScheduledGame[];
 }
 
 /** One round of games */
@@ -57,6 +67,14 @@ export class Round implements IQbjRound, IYftDataModelObject {
   /** The matches that took place in this round */
   matches: Match[] = [];
 
+  /**
+   * Pairings for this round that are scheduled but not entered.
+   *
+   * Kept strictly apart from `matches`. Nothing that counts, validates or reports games looks here,
+   * because a scheduled game is not a game that happened. See ScheduledGame.
+   */
+  scheduledGames: ScheduledGame[] = [];
+
   get id(): string {
     return `Round_${this.name}`;
   }
@@ -81,7 +99,11 @@ export class Round implements IQbjRound, IYftDataModelObject {
 
     if (qbjOnly) return qbjObject;
 
-    const yfData: IRoundExtraData = { number: this.number, nonNumericName: this._name };
+    const yfData: IRoundExtraData = {
+      number: this.number,
+      nonNumericName: this._name,
+      scheduledGames: this.scheduledGames.length > 0 ? this.scheduledGames.map((sg) => sg.toFileObject()) : undefined,
+    };
     const yftFileObj = { YfData: yfData, ...qbjObject };
 
     return yftFileObj;
@@ -97,6 +119,66 @@ export class Round implements IQbjRound, IYftDataModelObject {
 
   anyMatchesExist() {
     return this.matches.length > 0;
+  }
+
+  // --- scheduled games -------------------------------------------------------------------------
+  //
+  // None of these touch `matches`, and nothing above them does either. That separation is the whole
+  // point: `anyMatchesExist` must keep meaning "somebody entered a game", or the rule lock, the
+  // Games page counts and the stat report all start describing a schedule as though it were played.
+
+  anyScheduledGamesExist() {
+    return this.scheduledGames.length > 0;
+  }
+
+  addScheduledGame(game: ScheduledGame) {
+    this.scheduledGames.push(game);
+  }
+
+  deleteScheduledGame(game: ScheduledGame) {
+    this.scheduledGames = this.scheduledGames.filter((sg) => sg !== game);
+  }
+
+  findScheduledGameById(id: string) {
+    return this.scheduledGames.find((sg) => sg.id === id);
+  }
+
+  /** Scheduled games involving this team. Used to stop a team being scheduled twice in one round. */
+  findScheduledGamesWithTeam(team: Team) {
+    return this.scheduledGames.filter((sg) => sg.includesTeam(team));
+  }
+
+  /**
+   * Whether this team is already in a scheduled game this round.
+   * @param gameToIgnore The game being edited, which should not count as a conflict with itself
+   */
+  teamIsScheduledIn(team: Team, gameToIgnore?: ScheduledGame) {
+    return !!this.scheduledGames.find((sg) => sg !== gameToIgnore && sg.includesTeam(team));
+  }
+
+  /**
+   * The entered game that completed this scheduled game, if any.
+   *
+   * Matched on the scheduled game's own identity, never on "these two teams played sometime". A
+   * quadruple round robin contains the same pair four times on purpose, and pair-matching would call
+   * all four complete the moment the first was entered.
+   */
+  getMatchForScheduledGame(game: ScheduledGame) {
+    return this.matches.find((m) => m.scheduledGameId === game.id);
+  }
+
+  scheduledGameIsComplete(game: ScheduledGame) {
+    return this.getMatchForScheduledGame(game) !== undefined;
+  }
+
+  /** How many of this round's scheduled games have an entered game against them. */
+  countCompletedScheduledGames() {
+    return this.scheduledGames.filter((sg) => this.scheduledGameIsComplete(sg)).length;
+  }
+
+  /** Drop scheduled games that name a team the tournament no longer has. */
+  removeScheduledGamesWithTeam(team: Team) {
+    this.scheduledGames = this.scheduledGames.filter((sg) => !sg.includesTeam(team));
   }
 
   getPlayersWithData(team: Team) {

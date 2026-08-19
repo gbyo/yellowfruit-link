@@ -7,6 +7,7 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
   Divider,
   FormControl,
   FormControlLabel,
@@ -19,16 +20,30 @@ import {
   ListItemText,
   Radio,
   RadioGroup,
+  Stack,
   Tooltip,
   Typography,
 } from '@mui/material';
-import { Add, ArrowDownward, ArrowUpward, Delete, Edit, ExpandMore, LockOpen, Tune } from '@mui/icons-material';
+import {
+  Add,
+  ArrowDownward,
+  ArrowUpward,
+  Delete,
+  Edit,
+  ExpandMore,
+  LockOpen,
+  Shuffle,
+  Tune,
+} from '@mui/icons-material';
 import { TournamentContext } from '../TournamentManager';
 import YfCard from './YfCard';
 import useSubscription from '../Utils/CustomHooks';
 import { Phase, PhaseTypes, WildCardRankingMethod } from '../DataModel/Phase';
 import { Pool, advOpportunityDisplay } from '../DataModel/Pool';
 import { LinkButton } from '../Utils/GeneralReactUtils';
+import { Round } from '../DataModel/Round';
+import { ScheduledGame } from '../DataModel/ScheduledGame';
+import { phaseCanGeneratePairings } from '../DataModel/PairingGeneration';
 
 const cardTitle = 'Schedule Detail';
 const unlockCustSchedTooltip =
@@ -310,6 +325,9 @@ function PhaseEditor(props: IPhaseEditorProps) {
         </Typography>
         {selectedPool && <PoolDetail selectedPool={selectedPool} hasWildCardAdvancement={wcRules.length > 0} />}
       </Grid>
+      <Grid xs={12}>
+        <PhasePairingsSection phase={phase} />
+      </Grid>
       <Grid xs>
         {!usingTemplate && (
           <Button size="small" variant="outlined" startIcon={<Add />} onClick={() => tournManager.addPool(phase)}>
@@ -423,6 +441,163 @@ function ScheduleZeroState() {
       <Grid xs />
     </Grid>
   );
+}
+
+interface IPhasePairingsSectionProps {
+  phase: Phase;
+}
+
+/**
+ * The pairings for one stage, by round.
+ *
+ * Deliberately small. This is a list of who plays whom, not a scheduling application: a director
+ * needs to read the round off it, correct a pairing, and generate the round robin their pools imply.
+ * Anything more elaborate here would compete with the Rooms page, which is where a pairing is
+ * actually put to use.
+ *
+ * Collapsed by default, because a schedule template fills this in correctly and the common case is
+ * having no reason to look.
+ */
+function PhasePairingsSection(props: IPhasePairingsSectionProps) {
+  const { phase } = props;
+  const tournManager = useContext(TournamentContext);
+  const scheduledGames = phase.getAllScheduledGames();
+  const canGenerate = phaseCanGeneratePairings(phase);
+  const totalCompleted = phase.rounds.reduce((sum, rd) => sum + rd.countCompletedScheduledGames(), 0);
+
+  return (
+    <Accordion disableGutters sx={{ '&:before': { display: 'none' } }}>
+      <AccordionSummary expandIcon={<ExpandMore />}>
+        <Typography variant="subtitle2">Pairings</Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ ml: 1 }}>
+          {pairingSummary(scheduledGames.length, totalCompleted)}
+        </Typography>
+      </AccordionSummary>
+      <AccordionDetails>
+        <Stack spacing={1}>
+          {canGenerate && (
+            <Box>
+              <Tooltip title="Create a round robin for each pool in this stage, using the teams currently assigned to it">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<Shuffle />}
+                  onClick={() => tournManager.tryGeneratePairings(phase)}
+                >
+                  Generate round-robin pairings
+                </Button>
+              </Tooltip>
+            </Box>
+          )}
+          {phase.rounds.map((round) => (
+            <RoundPairings key={round.number} phase={phase} round={round} />
+          ))}
+        </Stack>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
+interface IRoundPairingsProps {
+  phase: Phase;
+  round: Round;
+}
+
+function RoundPairings(props: IRoundPairingsProps) {
+  const { phase, round } = props;
+  const tournManager = useContext(TournamentContext);
+  const { scheduledGames } = round;
+
+  return (
+    <Box>
+      <Stack direction="row" spacing={1} alignItems="center">
+        <Typography variant="body2" sx={{ fontWeight: 'medium' }}>
+          {round.displayName()}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          {pairingSummary(scheduledGames.length, round.countCompletedScheduledGames())}
+        </Typography>
+        <Tooltip title="Add a pairing to this round">
+          <IconButton size="small" onClick={() => tournManager.openScheduledGameModal(phase, round)}>
+            <Add fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Stack>
+      {scheduledGames.length > 0 && (
+        <List dense sx={{ py: 0, '& .MuiListItem-root': { py: 0 } }}>
+          {scheduledGames.map((game) => (
+            <ScheduledGameListItem key={game.id} phase={phase} round={round} game={game} />
+          ))}
+        </List>
+      )}
+    </Box>
+  );
+}
+
+interface IScheduledGameListItemProps {
+  phase: Phase;
+  round: Round;
+  game: ScheduledGame;
+}
+
+function ScheduledGameListItem(props: IScheduledGameListItemProps) {
+  const { phase, round, game } = props;
+  const tournManager = useContext(TournamentContext);
+  // One answer, from the model, for whether this pairing may be touched: played games and games a
+  // room is scoring are read-only here, and the Rooms page uses the same rule.
+  const lockReason = tournManager.scheduledGameLockReason(game, round);
+  const isPlayed = round.scheduledGameIsComplete(game);
+
+  return (
+    <ListItem
+      disableGutters
+      secondaryAction={
+        <Stack direction="row" spacing={0}>
+          <Tooltip title={lockReason ? `Can't edit: ${lockReason}` : 'Edit pairing'}>
+            <span>
+              <IconButton
+                size="small"
+                disabled={!!lockReason}
+                onClick={() => tournManager.openScheduledGameModal(phase, round, game)}
+              >
+                <Edit fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title={lockReason ? `Can't delete: ${lockReason}` : 'Delete pairing'}>
+            <span>
+              <IconButton
+                size="small"
+                disabled={!!lockReason}
+                onClick={() => tournManager.tryDeleteScheduledGame(round, game)}
+              >
+                <Delete fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Stack>
+      }
+    >
+      <ListItemText
+        primary={game.displayName()}
+        secondary={
+          isPlayed ? (
+            <Chip size="small" color="success" variant="outlined" label="Played" />
+          ) : (
+            lockReason && <Chip size="small" color="primary" variant="outlined" label={lockReason} />
+          )
+        }
+      />
+    </ListItem>
+  );
+}
+
+/** "2 scheduled - 1 completed", or "No pairings yet". */
+function pairingSummary(numScheduled: number, numCompleted: number) {
+  if (numScheduled === 0) return 'No pairings yet';
+  if (numCompleted === 0) return `${numScheduled} scheduled`;
+  if (numCompleted === numScheduled) return `${numCompleted} completed`;
+  return `${numScheduled} scheduled \u00b7 ${numCompleted} completed`;
 }
 
 function phaseRoundDisplay(phase: Phase) {

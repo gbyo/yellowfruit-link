@@ -74,6 +74,17 @@ export interface IYftFileMatch extends IQbjMatch, IYftFileObject {
 interface IMatchExtraData {
   otherValidation: IYftFileMatchValidationMsg[];
   importedFile?: string;
+  /**
+   * The ScheduledGame this entered game fulfils, if it fulfils one.
+   *
+   * This is what makes a scheduled game complete, and what makes completion survive closing and
+   * reopening the file. It is stored here rather than recovered from `id` because `tryToSetId` only
+   * preserves the `Match_<n>` form, so a scheduled game's own identity cannot ride in `Match.id`.
+   *
+   * Absent on every match entered by hand, imported from an unrelated file, or written before this
+   * field existed - all of which are ordinary games that simply fulfil no pairing.
+   */
+  scheduledGameId?: string;
 }
 
 /** A single match scheduled between two teams */
@@ -118,6 +129,15 @@ export class Match implements IQbjMatch, IYftDataModelObject {
 
   /** The name of the file that the game was imported from */
   importedFile?: string;
+
+  /**
+   * The ScheduledGame this game fulfils, if any. See IMatchExtraData.scheduledGameId.
+   *
+   * Set when a result arrives carrying a scheduled game's identity - over QBTCP or as the file
+   * exported for the same assignment, which are the same identity by construction. Never inferred
+   * from the teams and round, because a repeated round robin contains the same pair more than once.
+   */
+  scheduledGameId?: string;
 
   /** Whether this game should count towards stats */
   statsValidity: StatsValidity = StatsValidity.valid;
@@ -195,6 +215,7 @@ export class Match implements IQbjMatch, IYftDataModelObject {
     this.matchQuestions = source.matchQuestions.map((mq) => mq.makeCopy());
     this.statsValidity = source.statsValidity;
     this.importedFile = source.importedFile;
+    this.scheduledGameId = source.scheduledGameId;
 
     this.totalTuhFieldValidation = source.totalTuhFieldValidation.makeCopy();
     this.overtimeTuhFieldValidation = source.overtimeTuhFieldValidation.makeCopy();
@@ -224,6 +245,7 @@ export class Match implements IQbjMatch, IYftDataModelObject {
     const yfData: IMatchExtraData = {
       otherValidation: this.modalBottomValidation.toFileObject(),
       importedFile: this.importedFile,
+      scheduledGameId: this.scheduledGameId,
     };
     const yftFileObj = { YfData: yfData, ...qbjObject };
 
