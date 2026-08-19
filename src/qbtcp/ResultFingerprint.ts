@@ -172,20 +172,27 @@ export function findResultMatchList(document: unknown): Record<string, unknown>[
   if (!isPlainObject(document)) return [];
   if (Array.isArray(document.objects)) {
     const objects = document.objects.filter(isPlainObject);
-    // Top-level matches first, so the first entry is the one a single-game document means.
-    const matches = objects.filter((entry) => entry.type === 'Match');
-    const seen = new Set(matches);
+    // Top-level matches first, so the first entry is the one a single-game document means. Match IDs
+    // are QBJ's stable identity, so duplicate serializations of the same game are only returned once.
+    const matches: Record<string, unknown>[] = [];
+    const seenMatchIds = new Set<string>();
+    const addMatch = (match: Record<string, unknown>) => {
+      const matchId = typeof match.id === 'string' && match.id !== '' ? match.id : undefined;
+      if (matchId && seenMatchIds.has(matchId)) return;
+      if (matchId) seenMatchIds.add(matchId);
+      matches.push(match);
+    };
+    for (const match of objects.filter((entry) => entry.type === 'Match')) addMatch(match);
     // A schedule may also write its games inline inside the rounds that hold them rather than as
     // top-level objects. Those are the same games, and a file whose games are spelled that way is
     // still a file whose games must not be imported twice.
     for (const entry of objects) {
-      for (const phase of arrayOf(entry.phases)) {
-        for (const round of arrayOf(phase.rounds)) {
-          for (const match of arrayOf(round.matches)) {
-            if (typeof match.$ref === 'string' || seen.has(match)) continue;
-            seen.add(match);
-            matches.push(match);
-          }
+      const rounds =
+        entry.type === 'Round' ? [entry] : arrayOf(entry.phases).flatMap((phase) => arrayOf(phase.rounds));
+      for (const round of rounds) {
+        for (const match of arrayOf(round.matches)) {
+          if (typeof match.$ref === 'string') continue;
+          addMatch(match);
         }
       }
     }

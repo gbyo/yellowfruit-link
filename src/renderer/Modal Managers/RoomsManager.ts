@@ -62,6 +62,9 @@ export default class RoomsManager {
   /** Sequence assigned to the newest command, so older replies cannot replace newer state. */
   private nextRequestId: number = 0;
 
+  /** Sequence assigned to background polls, so older poll replies cannot replace newer status. */
+  private nextPollId: number = 0;
+
   /** Replaced by the Rooms page while it is mounted. */
   dataChangedReactCallback: () => void = noop;
 
@@ -77,9 +80,12 @@ export default class RoomsManager {
    * wrote `lastError` would replace the message explaining what a director's last click did.
    */
   private async send(command: QbtcpCommand, background = false): Promise<QbtcpCommandResult> {
-    // A background poll takes no sequence number. Taking one would make every command already in
-    // flight look superseded, and the reply a director is actually waiting on would be thrown away.
+    // A background poll takes no foreground sequence number. It gets its own monotonic id and also
+    // remembers the newest foreground id so a reply cannot land over a command that started later.
     const requestId = background ? 0 : ++this.nextRequestId;
+    const pollId = background ? ++this.nextPollId : 0;
+    const foregroundRequestIdAtDispatch = this.nextRequestId;
+    const foregroundWasInFlightAtDispatch = this.inFlight > 0;
     if (!background) {
       this.inFlight += 1;
       this.busy = true;
@@ -98,9 +104,19 @@ export default class RoomsManager {
         this.busy = this.inFlight > 0;
       }
       if (background) {
-        // A poll only fills in the quiet moments. It never lands on top of a command's outcome, and
-        // a poll that failed says nothing at all - the next one is fifteen seconds away.
-        if (reply.ok && 'status' in reply && this.inFlight === 0) this.status = reply.status;
+        // A poll only fills in the quiet moments. It never lands on top of a command's outcome, an
+        // older poll, a foreground request that was already active when this poll was dispatched, or
+        // one that began later.
+        if (
+          reply.ok &&
+          'status' in reply &&
+          this.inFlight === 0 &&
+          !foregroundWasInFlightAtDispatch &&
+          pollId === this.nextPollId &&
+          foregroundRequestIdAtDispatch === this.nextRequestId
+        ) {
+          this.status = reply.status;
+        }
       } else if (requestId === this.nextRequestId) {
         // Only the newest command's reply may write state, so a slow reply cannot replace a newer one.
         if (reply.ok) {

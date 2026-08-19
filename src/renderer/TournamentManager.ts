@@ -734,7 +734,14 @@ export class TournamentManager {
         singleResult.sourceMatch = rawMatches[index].match as unknown as object;
       }
       importResults.push(singleResult);
-      const roundToUse = round ?? this.tournament.getRoundObjByNumber(roundNumberFromName(matchAndRound.roundName));
+      const parsedRoundNumber = roundNumberFromName(matchAndRound.roundName);
+      const roundToUse =
+        round ??
+        (Number.isNaN(parsedRoundNumber)
+          ? this.tournament.phases
+              .flatMap((entry) => entry.rounds)
+              .find((entry) => entry.name === matchAndRound.roundName)
+          : this.tournament.getRoundObjByNumber(parsedRoundNumber));
       if (roundToUse === undefined) {
         // Pushed above rather than below, because the message built here is the only account the
         // director gets of why this game was left out.
@@ -2002,13 +2009,13 @@ class NullTournamentManager extends TournamentManager {
   requestAppVersion(): void {}
 
   // eslint-disable-next-line class-methods-use-this
-  requestBackupFile(): void {}
+  protected requestBackupFile(): void {}
 
   // eslint-disable-next-line class-methods-use-this
   checkForNewVersion(): void {}
 
   // eslint-disable-next-line class-methods-use-this
-  setFilePath(): void {}
+  protected setFilePath(): void {}
 }
 
 /** A sentence describing what a pairing generation run did. */

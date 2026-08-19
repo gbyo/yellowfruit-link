@@ -60,17 +60,15 @@ export interface IRoomAssignment {
 }
 
 /**
- * A capability issued for one session, to one device.
+ * A capability issued for one session.
  *
- * One token per device rather than one per session. A shared token cannot say which of two devices
- * presented it, so writer ownership could only be enforced against an informational header that the
- * client is not required to send. Binding the capability to the device it was issued to moves that
- * identity into the credential, where it cannot be omitted.
+ * The token is the non-forgeable identity. `deviceId` is useful attribution attached to that token,
+ * but a caller supplying the same text on a later open is not proof that it owns an existing grant.
  */
 export interface ISessionGrant {
-  /** The device this capability was issued to. Null when the client did not identify itself. */
+  /** Informational device identity associated with this capability, if the client supplied one. */
   deviceId: string | null;
-  /** Capability token scoped to this session and this device. Secret. */
+  /** Capability token scoped to this session. Secret. */
   token: string;
 }
 
@@ -79,9 +77,11 @@ export interface ISession {
   id: string;
   roomId: string;
   matchId: string;
-  /** Every capability issued for this session, one per device. Secret. */
+  /** Every capability issued for this session. Secret. */
   grants: ISessionGrant[];
-  /** The device that may write. Null means the next writer claims it. */
+  /** Capability that currently owns writer authority. Secret; null means the next grant claims it. */
+  writerGrantToken: string | null;
+  /** Informational label for the current writer. Writer authority comes from writerGrantToken. */
   writerDeviceId: string | null;
   /** Highest progress sequence accepted. A lower one is discarded silently. */
   progressSequence: number;

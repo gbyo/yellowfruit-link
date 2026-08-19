@@ -706,14 +706,14 @@ export default class FileParser {
     // A round called "Final" or "Tiebreaker" is ordered by its position in the file rather than by
     // its name. It is still a round with games in it, so parsing continues from here rather than
     // returning - an early return used to leave every such round empty.
-    const isNonNumeric = Number.isNaN(roundNumber);
+    const isNonNumeric = !Number.isFinite(roundNumber);
     const yftRound = new Round(isNonNumeric ? fallbackRoundNo : roundNumber);
-    if (isNonNumeric) yftRound.name = qbjRound.name;
+    if (isNonNumeric && typeof qbjRound.name === 'string') yftRound.name = qbjRound.name;
 
     const packetFromFile = this.parseRoundPacket(qbjRound);
     if (packetFromFile) yftRound.packet = packetFromFile;
 
-    if (yfExtraData?.nonNumericName) yftRound.name = yfExtraData.nonNumericName;
+    if (typeof yfExtraData?.nonNumericName === 'string') yftRound.name = yfExtraData.nonNumericName;
     yftRound.matches = this.parseRoundMatches(qbjRound);
     yftRound.scheduledGames = this.parseScheduledGames(yfExtraData?.scheduledGames);
     return yftRound;
@@ -1344,7 +1344,7 @@ function qbjMatchHasScoringContent(qbjMatch: Record<string, unknown>): boolean {
 }
 
 /**
- * The number a round name stands for, or undefined when the name is not a number.
+ * The number a round name stands for, or NaN when the name is not a number.
  *
  * The whole name has to be one. `parseFloat`/`parseInt` read "3A" as 3, and a game filed into round
  * 3 because its round was called "3A" is a game in the wrong round - which is worse than a round
@@ -1352,8 +1352,9 @@ function qbjMatchHasScoringContent(qbjMatch: Record<string, unknown>): boolean {
  * allowed: tiebreaker and finals rounds are ordered with them.
  */
 export function roundNumberFromName(name: unknown): number {
-  const text = typeof name === 'string' ? name.trim() : name;
-  if (text === '' || text === null || text === undefined) return NaN;
+  if (typeof name !== 'string') return NaN;
+  const text = name.trim();
+  if (text === '') return NaN;
   const parsed = Number(text);
   return Number.isFinite(parsed) ? parsed : NaN;
 }

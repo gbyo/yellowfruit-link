@@ -32,6 +32,8 @@ test('a round name is a number only when the whole name is one', () => {
   expect(Number.isNaN(roundNumberFromName('Final'))).toBe(true);
   expect(Number.isNaN(roundNumberFromName(''))).toBe(true);
   expect(Number.isNaN(roundNumberFromName(undefined))).toBe(true);
+  expect(Number.isNaN(roundNumberFromName(true))).toBe(true);
+  expect(Number.isNaN(roundNumberFromName([5]))).toBe(true);
 });
 
 test('a round with a non-numeric name keeps its packet and its games', () => {
@@ -60,6 +62,39 @@ test('a round with a non-numeric name keeps its packet and its games', () => {
   expect(round?.number).toBe(7);
   expect(round?.packet.name).toBe('Spare 1');
   expect(round?.matches).toHaveLength(1);
+});
+
+test('a YFT round missing its stored number falls back to file order', () => {
+  const { parser } = parserFor();
+  const round = parser.parseRound(
+    { type: 'Round', name: 'Final', YfData: {}, matches: [] } as unknown as IIndeterminateQbj,
+    9,
+  );
+
+  expect(round?.number).toBe(9);
+  expect(round?.name).toBe('Final');
+});
+
+test('non-string round names are not stored in the Round model', () => {
+  const { parser } = parserFor();
+  const malformedName = parser.parseRound(
+    { type: 'Round', name: true, matches: [] } as unknown as IIndeterminateQbj,
+    6,
+  );
+  const malformedYftName = parser.parseRound(
+    {
+      type: 'Round',
+      name: '4',
+      YfData: { number: 4, nonNumericName: [5] },
+      matches: [],
+    } as unknown as IIndeterminateQbj,
+    6,
+  );
+
+  expect(malformedName?.number).toBe(6);
+  expect(malformedName?.name).toBe('6');
+  expect(malformedYftName?.number).toBe(4);
+  expect(malformedYftName?.name).toBe('4');
 });
 
 test('a round named with a numeric prefix is not treated as that number', () => {

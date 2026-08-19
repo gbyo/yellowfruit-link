@@ -309,10 +309,12 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     ) {
       return keep(null);
     }
-    // A token that is not a string can never equal the string a request carries, so a room holding
-    // one would read as paired on the Rooms page and refuse every device that tried to use it.
-    // Dropping the field alone says the truth - this room is not paired - without losing the room.
-    if (room.roomToken !== undefined && typeof room.roomToken !== 'string') {
+    // A missing or unusable token cannot authenticate a request, so retaining one would make a room
+    // read as paired while every scoresheet was refused. Drop the field without losing the room.
+    if (
+      room.roomToken !== undefined &&
+      (typeof room.roomToken !== 'string' || room.roomToken.trim() === '')
+    ) {
       discarded += 1;
       return [{ ...without(room, 'roomToken'), enabled: room.enabled ?? true }];
     }
@@ -327,10 +329,10 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
       : keep(null),
   );
   const sessions = records(parsed.sessions).flatMap((session) => {
-    const writerDeviceId =
+    const legacyWriterDeviceId =
       session.writerDeviceId === undefined || session.writerDeviceId === null ? null : session.writerDeviceId;
-    if (writerDeviceId !== null && typeof writerDeviceId !== 'string') return keep(null);
-    const grants = sessionGrants(session, writerDeviceId);
+    if (legacyWriterDeviceId !== null && typeof legacyWriterDeviceId !== 'string') return keep(null);
+    const grants = sessionGrants(session, legacyWriterDeviceId);
     if (
       typeof session.id !== 'string' ||
       typeof session.roomId !== 'string' ||
@@ -345,6 +347,25 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     ) {
       return keep(null);
     }
+
+    let writerGrantToken: string | null;
+    if (session.writerGrantToken === undefined) {
+      // State written before credential-bound writer ownership used the device label as the lock.
+      // Migrate that label to the capability already associated with it, if one exists.
+      writerGrantToken = grants.find((grant) => grant.deviceId === legacyWriterDeviceId)?.token ?? null;
+    } else if (session.writerGrantToken === null) {
+      writerGrantToken = null;
+    } else if (
+      typeof session.writerGrantToken === 'string' &&
+      session.writerGrantToken.trim() !== '' &&
+      grants.some((grant) => grant.token === session.writerGrantToken)
+    ) {
+      writerGrantToken = session.writerGrantToken;
+    } else {
+      return keep(null);
+    }
+    const writerGrant = writerGrantToken === null ? undefined : grants.find((grant) => grant.token === writerGrantToken);
+
     return [
       {
         // `sessionToken` is dropped: it has been migrated into a grant, and leaving it behind would
@@ -353,7 +374,9 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
         grants,
         progressSequence: session.progressSequence ?? 0,
         finalReceived: session.finalReceived ?? false,
-        writerDeviceId,
+        writerGrantToken,
+        // The label follows the credential. A hand-edited or stale label can never create authority.
+        writerDeviceId: writerGrant?.deviceId ?? null,
       },
     ];
   });
@@ -377,7 +400,11 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     }
     return [{ ...result, status: (result.status as ReceivedResultStatus | undefined) ?? 'needs-review' }];
   });
-  const presence = records(parsed.presence).flatMap((p) => (typeof p.roomId === 'string' ? [p] : keep(null)));
+  const now = Date.now();
+  const presence = records(parsed.presence).flatMap((p) => {
+    const lastSeenAt = typeof p.lastSeenAt === 'string' ? Date.parse(p.lastSeenAt) : NaN;
+    return typeof p.roomId === 'string' && Number.isFinite(lastSeenAt) && lastSeenAt <= now ? [p] : keep(null);
+  });
 
   return {
     discarded,
