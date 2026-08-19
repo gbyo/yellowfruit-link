@@ -179,6 +179,95 @@ test('a multi-game file is classified and recorded one game at a time', async ()
   }
 });
 
+test('an unresolved QBTCP result does not classify itself as a duplicate during review', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-self-review-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('self-review-tournament');
+
+    const document = {
+      type: 'Match',
+      id: 'Match_round_3',
+      tossups_read: 20,
+      match_teams: [
+        { team: { $ref: 'Team_left' }, points: 300 },
+        { team: { $ref: 'Team_right' }, points: 100 },
+      ],
+      _qbsheet_source: { tournamentId: 'self-review-tournament' },
+    };
+    const identity = readResultIdentity(document);
+    if (!identity?.matchId) throw new Error('fixture has no result identity');
+    const currentResultId = 'res-current';
+    server.getState().results.push({
+      id: currentResultId,
+      roomId: 'room-3',
+      sessionId: 'session-3',
+      matchId: identity.matchId,
+      fingerprint: identity.fingerprint,
+      status: 'needs-review',
+      document,
+      receivedAt: '2026-08-19T12:00:00.000Z',
+      roundNumber: 3,
+    });
+
+    expect(server.classifyResults(document)).toEqual([{ kind: 'duplicate', existingId: currentResultId }]);
+    expect(server.classifyResults(document, currentResultId)).toEqual([{ kind: 'new' }]);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('excluding the result under review still surfaces its conflict with an earlier result', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-self-conflict-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('self-review-tournament');
+
+    const game = (points: number) => ({
+      type: 'Match',
+      id: 'Match_round_3',
+      tossups_read: 20,
+      match_teams: [
+        { team: { $ref: 'Team_left' }, points },
+        { team: { $ref: 'Team_right' }, points: 100 },
+      ],
+      _qbsheet_source: { tournamentId: 'self-review-tournament' },
+    });
+    const earlier = game(300);
+    await server.recordFileResult(earlier);
+    const earlierResultId = server.getState().results[0].id;
+
+    const current = game(320);
+    const identity = readResultIdentity(current);
+    if (!identity?.matchId) throw new Error('fixture has no result identity');
+    const currentResultId = 'res-current-conflict';
+    server.getState().results.push({
+      id: currentResultId,
+      roomId: 'room-3',
+      sessionId: 'session-3',
+      matchId: identity.matchId,
+      fingerprint: identity.fingerprint,
+      status: 'conflict',
+      conflictsWithResultId: earlierResultId,
+      document: current,
+      receivedAt: '2026-08-19T12:00:00.000Z',
+      roundNumber: 3,
+    });
+
+    expect(server.classifyResults(current, currentResultId)).toEqual([
+      { kind: 'conflict', existingId: earlierResultId },
+    ]);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a game from another tournament is not mistaken for this tournament's", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-foreign-'));
   try {
@@ -214,9 +303,14 @@ test("a game from another tournament is not mistaken for this tournament's", asy
 
 test('rejects a bare result whose source revision is stale or whose names are misassigned', () => {
   const { assignment, tournamentId } = buildFixture();
-  const stale = bareQbsheetResult(tournamentId, assignment.matchId, assignment.revision + 1);
-  expect(validateResultAgainstAssignment(stale, assignment)).toBe(
-    'That result belongs to an older assignment for this room.',
+  const stale = bareQbsheetResult(tournamentId, assignment.matchId, assignment.revision);
+  expect(validateResultAgainstAssignment(stale, { ...assignment, revision: assignment.revision + 1 })).toBe(
+    'A newer assignment has superseded this game.',
+  );
+
+  const future = bareQbsheetResult(tournamentId, assignment.matchId, assignment.revision + 1);
+  expect(validateResultAgainstAssignment(future, assignment)).toBe(
+    'That result does not match this room’s current assignment.',
   );
 
   const wrongTeams = bareQbsheetResult(tournamentId, assignment.matchId);

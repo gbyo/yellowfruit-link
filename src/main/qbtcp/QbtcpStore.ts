@@ -30,10 +30,12 @@ import { writeFileAtomically, IAtomicFileSystem } from './AtomicFile';
 import {
   IQbtcpTournamentState,
   ISessionGrant,
+  HelpRequestStatus,
   emptyQbtcpState,
   qbtcpStateVersion,
   ReceivedResultStatus,
 } from '../../qbtcp/QbtcpState';
+import { qbtcpHelpCategories, QbtcpHelpCategory } from '../../qbtcp/QbtcpProtocol';
 
 export interface IQbtcpStoreLoad {
   state: IQbtcpTournamentState;
@@ -311,10 +313,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     }
     // A missing or unusable token cannot authenticate a request, so retaining one would make a room
     // read as paired while every scoresheet was refused. Drop the field without losing the room.
-    if (
-      room.roomToken !== undefined &&
-      (typeof room.roomToken !== 'string' || room.roomToken.trim() === '')
-    ) {
+    if (room.roomToken !== undefined && (typeof room.roomToken !== 'string' || room.roomToken.trim() === '')) {
       discarded += 1;
       return [{ ...without(room, 'roomToken'), enabled: room.enabled ?? true }];
     }
@@ -364,7 +363,8 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     } else {
       return keep(null);
     }
-    const writerGrant = writerGrantToken === null ? undefined : grants.find((grant) => grant.token === writerGrantToken);
+    const writerGrant =
+      writerGrantToken === null ? undefined : grants.find((grant) => grant.token === writerGrantToken);
 
     return [
       {
@@ -405,6 +405,28 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     const lastSeenAt = typeof p.lastSeenAt === 'string' ? Date.parse(p.lastSeenAt) : NaN;
     return typeof p.roomId === 'string' && Number.isFinite(lastSeenAt) && lastSeenAt <= now ? [p] : keep(null);
   });
+  const validHelpStatuses = new Set<HelpRequestStatus>(['open', 'cancelled', 'resolved']);
+  const validHelpCategories = new Set<QbtcpHelpCategory>(qbtcpHelpCategories);
+  const helpRequests = records(parsed.helpRequests).flatMap((request) => {
+    if (
+      typeof request.id !== 'string' ||
+      typeof request.roomId !== 'string' ||
+      typeof request.roomName !== 'string' ||
+      typeof request.category !== 'string' ||
+      !validHelpCategories.has(request.category as QbtcpHelpCategory) ||
+      typeof request.message !== 'string' ||
+      typeof request.status !== 'string' ||
+      !validHelpStatuses.has(request.status as HelpRequestStatus) ||
+      typeof request.createdAt !== 'string' ||
+      typeof request.updatedAt !== 'string' ||
+      (request.deviceId !== undefined && typeof request.deviceId !== 'string') ||
+      (request.operatorName !== undefined && typeof request.operatorName !== 'string') ||
+      (request.currentMatchup !== undefined && !isPlainObject(request.currentMatchup))
+    ) {
+      return keep(null);
+    }
+    return [request];
+  });
 
   return {
     discarded,
@@ -417,6 +439,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
       sessions,
       results,
       presence,
+      helpRequests,
     } as unknown as IQbtcpTournamentState,
   };
 }

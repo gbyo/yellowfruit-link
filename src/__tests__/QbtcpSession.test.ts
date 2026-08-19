@@ -12,16 +12,32 @@ import os from 'os';
 import path from 'path';
 import QbtcpServer from '../main/qbtcp/QbtcpServer';
 import QbtcpStore from '../main/qbtcp/QbtcpStore';
-import { deviceIdHeader, roomTokenHeader, sessionTokenHeader } from '../qbtcp/QbtcpProtocol';
+import {
+  deviceIdHeader,
+  operatorNameHeader,
+  qbtcpHelpCategories,
+  roomTokenHeader,
+  sessionTokenHeader,
+} from '../qbtcp/QbtcpProtocol';
+import { IQbtcpRosterPlayerRequest } from '../qbtcp/QbtcpState';
 
 const temporaryDirectories: string[] = [];
 let server: QbtcpServer;
 let baseUrl: string;
+let rosterRequests: IQbtcpRosterPlayerRequest[];
 
 async function startServer(): Promise<void> {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-session-'));
   temporaryDirectories.push(directory);
-  server = new QbtcpServer(new QbtcpStore(directory), { onResultReceived: () => {}, onStateChanged: () => {} });
+  rosterRequests = [];
+  server = new QbtcpServer(new QbtcpStore(directory), {
+    onResultReceived: () => {},
+    onStateChanged: () => {},
+    onRosterPlayerRequested: async (request) => {
+      rosterRequests.push(request);
+      return { ok: true };
+    },
+  });
   await server.bindTournament('tournament-under-test');
   // Port zero so the OS picks a free one; nothing here may depend on a port being available.
   await server.start(0);
@@ -236,6 +252,10 @@ test('a finished game stops accepting progress and stops being offered as resuma
   expect(final.status).toBe(200);
   expect(final.body.accepted).toBe(true);
 
+  const received = server.unresolvedResults()[0];
+  expect(received).toBeDefined();
+  expect(server.classifyResults(received.document, received.id)).toEqual([{ kind: 'new' }]);
+
   const late = await call('PUT', `/sessions/${opened.body.session_id}/progress`, {
     headers: { [sessionTokenHeader]: opened.body.token },
     body: { sequence: 99, match: { tossups_read: 3 } },
@@ -333,4 +353,206 @@ test('the chosen self-hosted scoresheet origin is allowed through CORS', async (
   // Still an exact allowlist, not an opening of the door.
   const other = await fetch(`${baseUrl}`, { headers: { Origin: 'https://not-the-scoresheet.example' } });
   expect(other.status).toBe(403);
+});
+
+test('discovery advertises the current protocol without exposing tournament operations', async () => {
+  const room = await server.addRoom('Secret Room 204');
+  server.displayName = 'Greenwood Fall Invitational';
+
+  const response = await fetch(baseUrl);
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body).toEqual({
+    protocol: 'QBTCP',
+    version: 1,
+    capabilities: ['pairing', 'assignment', 'progress', 'result', 'recovery', 'help', 'presence', 'roster'],
+    help_categories: qbtcpHelpCategories,
+    qbj_version: '2.1.1',
+    name: 'Greenwood Fall Invitational',
+  });
+  expect(JSON.stringify(body)).not.toContain(room.name);
+  expect(JSON.stringify(body)).not.toContain(room.pairingCode);
+});
+
+test('a room device can open, read, and cancel one help request while the director can resolve it', async () => {
+  const { roomToken } = await pairedRoomWithAssignment();
+  const headers = {
+    [roomTokenHeader]: roomToken,
+    [deviceIdHeader]: 'chromebook-1',
+    [operatorNameHeader]: 'Alex Scorekeeper',
+  };
+
+  expect((await call('GET', '/help', { headers })).body).toEqual({ request: null });
+
+  const opened = await call('POST', '/help', {
+    headers,
+    body: { category: 'question-packet', message: 'We were given the wrong packet.' },
+  });
+  expect(opened.status).toBe(200);
+  expect(opened.body.request).toMatchObject({
+    roomName: 'Room 1',
+    category: 'question-packet',
+    message: 'We were given the wrong packet.',
+    status: 'open',
+    deviceId: 'chromebook-1',
+    operatorName: 'Alex Scorekeeper',
+    currentMatchup: {
+      roundNumber: 3,
+      roundName: 'Round 3',
+      leftTeam: 'Ninety Six',
+      rightTeam: 'Greenwood',
+    },
+  });
+
+  const repeated = await call('POST', '/help', {
+    headers,
+    body: { category: 'other', message: 'A duplicate click must not create another request.' },
+  });
+  expect(repeated.body.request.id).toBe(opened.body.request.id);
+  expect(server.getState().helpRequests).toHaveLength(1);
+
+  const otherDevice = { ...headers, [deviceIdHeader]: 'phone-2' };
+  expect((await call('GET', '/help', { headers: otherDevice })).body).toEqual({ request: null });
+  expect((await call('DELETE', `/help/${opened.body.request.id}`, { headers: otherDevice })).body).toEqual({
+    request: null,
+  });
+  expect((await call('GET', '/help', { headers })).body.request.id).toBe(opened.body.request.id);
+
+  const cancelled = await call('DELETE', `/help/${opened.body.request.id}`, { headers });
+  expect(cancelled.body.request.status).toBe('cancelled');
+  expect((await call('GET', '/help', { headers })).body).toEqual({ request: null });
+
+  const reopened = await call('POST', '/help', { headers, body: { category: 'rules-question' } });
+  await server.resolveHelpRequest(reopened.body.request.id);
+  expect((await call('GET', '/help', { headers })).body).toEqual({ request: null });
+  expect(server.getState().helpRequests.at(-1)?.status).toBe('resolved');
+});
+
+test('the authenticated QBSheet roster extension adds players only to a team in the active session', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const opened = await openSession(roomToken, matchId, 'chromebook-1');
+  const headers = { [roomTokenHeader]: roomToken, [sessionTokenHeader]: opened.body.token };
+
+  const added = await call('POST', '/roster/players', {
+    headers,
+    body: { sessionId: opened.body.session_id, teamName: 'Ninety Six', playerName: 'New Player' },
+  });
+  expect(added.status).toBe(200);
+  expect(added.body).toEqual({ added: true, teamName: 'Ninety Six', playerName: 'New Player' });
+  expect(rosterRequests).toHaveLength(1);
+  expect(rosterRequests[0]).toMatchObject({
+    sessionId: opened.body.session_id,
+    teamId: 'Team_left',
+    teamName: 'Ninety Six',
+    playerName: 'New Player',
+  });
+
+  const wrongTeam = await call('POST', '/roster/players', {
+    headers,
+    body: { sessionId: opened.body.session_id, teamName: 'Clinton', playerName: 'Another Player' },
+  });
+  expect(wrongTeam.status).toBe(409);
+  expect(rosterRequests).toHaveLength(1);
+
+  const missingSessionCapability = await call('POST', '/roster/players', {
+    headers: { [roomTokenHeader]: roomToken },
+    body: { sessionId: opened.body.session_id, teamName: 'Ninety Six', playerName: 'Another Player' },
+  });
+  expect(missingSessionCapability.status).toBe(401);
+});
+
+test('assignment responses and private-network preflights use the current wire contract', async () => {
+  const { roomToken } = await pairedRoomWithAssignment();
+
+  const assignment = await fetch(`${baseUrl}/assignment`, { headers: { [roomTokenHeader]: roomToken } });
+  expect(assignment.status).toBe(200);
+  expect(assignment.headers.get('content-type')).toBe('application/vnd.quizbowl.qbj+json');
+
+  const status = await call('GET', '/assignment/status', { headers: { [roomTokenHeader]: roomToken } });
+  expect(status.body).toMatchObject({
+    state: 'assigned',
+    blocked_reason: null,
+    blocked_message: null,
+    session: null,
+    released_round: 3,
+    hold_new_starts: false,
+    previous: null,
+    next: null,
+  });
+
+  const preflight = await fetch(`${baseUrl}/assignment`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://qbsheet.com',
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': roomTokenHeader,
+      'Access-Control-Request-Private-Network': 'true',
+    },
+  });
+  expect(preflight.status).toBe(204);
+  expect(preflight.headers.get('access-control-allow-origin')).toBe('https://qbsheet.com');
+  expect(preflight.headers.get('access-control-allow-private-network')).toBe('true');
+  expect(preflight.headers.get('access-control-allow-headers')).toContain('access-control-request-private-network');
+  expect(preflight.headers.get('vary')).toContain('Origin');
+});
+
+test('known QBTCP resources return 405 for unsupported methods before authentication', async () => {
+  expect((await call('POST', '')).status).toBe(405);
+  expect((await call('GET', '/pair')).status).toBe(405);
+  expect((await call('POST', '/assignment')).status).toBe(405);
+  expect((await call('GET', '/sessions')).status).toBe(405);
+  expect((await call('DELETE', '/presence')).status).toBe(405);
+  expect((await call('POST', '/sessions/not-open/recovery')).status).toBe(405);
+});
+
+test('an exact result retry stays idempotent after the room advances, while changed work receives 410', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const roomId = server.getState().rooms[0].id;
+  const opened = await openSession(roomToken, matchId, 'chromebook-1');
+  const result = {
+    type: 'Match',
+    id: matchId,
+    tossups_read: 20,
+    match_teams: [
+      { team: { $ref: 'Team_left' }, points: 300 },
+      { team: { $ref: 'Team_right' }, points: 100 },
+    ],
+    _qbtcp: { version: 1, round_revision: 1 },
+  };
+
+  const first = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: result,
+  });
+  expect(first.status).toBe(200);
+  await server.resolveResult(server.getState().results[0].id, 'accepted');
+
+  expect(
+    await server.setAssignment(
+      {
+        roomId,
+        roundNumber: 4,
+        leftTeamId: 'Team_left',
+        rightTeamId: 'Team_right',
+        leftTeamName: 'Ninety Six',
+        rightTeamName: 'Greenwood',
+        matchId: 'Match_test02',
+        document: { version: '2.1.1', objects: [] },
+      },
+      2,
+    ),
+  ).toMatchObject({ revision: 2 });
+
+  const retry = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: result,
+  });
+  expect(retry.status).toBe(200);
+  expect(retry.body.duplicate).toBe(true);
+
+  const changed = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: { ...result, tossups_read: 21 },
+  });
+  expect(changed.status).toBe(410);
 });

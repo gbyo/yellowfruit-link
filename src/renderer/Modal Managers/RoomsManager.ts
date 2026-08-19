@@ -199,6 +199,10 @@ export default class RoomsManager {
     await this.send({ kind: 'clearAssignment', roomId });
   }
 
+  async resolveHelpRequest(requestId: string): Promise<void> {
+    await this.send({ kind: 'resolveHelpRequest', requestId });
+  }
+
   /**
    * Why this scheduled game cannot be assigned right now, or undefined if it can.
    *
