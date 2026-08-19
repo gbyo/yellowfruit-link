@@ -9,6 +9,7 @@ import { Team } from './Team';
 import { makeQbjRefPointer } from './QbjUtils';
 import { Match } from './Match';
 import { Player } from './Player';
+import { ScheduledGame } from './ScheduledGame';
 import { sumReduce } from '../Utils/GeneralUtils';
 
 export enum PhaseTypes {
@@ -464,6 +465,46 @@ export class Phase implements IQbjPhase, IYftDataModelObject {
       if (rd.anyMatchesExist()) return true;
     }
     return false;
+  }
+
+  // --- scheduled games -------------------------------------------------------------------------
+  //
+  // Separate from every match-based method above. A phase with a full schedule and no results has no
+  // matches, and `anyMatchesExist` has to keep saying so.
+
+  getAllScheduledGames(): ScheduledGame[] {
+    return this.rounds.map((rd) => rd.scheduledGames).flat();
+  }
+
+  anyScheduledGamesExist() {
+    return !!this.rounds.find((rd) => rd.anyScheduledGamesExist());
+  }
+
+  /** The scheduled game with this id, and the round holding it. */
+  findScheduledGameById(id: string): { game: ScheduledGame; round: Round } | undefined {
+    for (const rd of this.rounds) {
+      const game = rd.findScheduledGameById(id);
+      if (game) return { game, round: rd };
+    }
+    return undefined;
+  }
+
+  getRoundOfScheduledGame(game: ScheduledGame) {
+    return this.rounds.find((rd) => rd.scheduledGames.includes(game));
+  }
+
+  /** Drop every pairing naming this team. Used when a team leaves the tournament. */
+  removeScheduledGamesWithTeam(team: Team) {
+    for (const rd of this.rounds) {
+      rd.removeScheduledGamesWithTeam(team);
+    }
+  }
+
+  /** Remove every pairing in this phase. Caller is responsible for deciding that's safe. */
+  clearScheduledGames() {
+    for (const rd of this.rounds) {
+      rd.scheduledGames = [];
+    }
   }
 
   getPlayersWithData(team: Team) {

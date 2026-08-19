@@ -6,9 +6,16 @@ import { NullDate, NullObjects } from '../Utils/UtilTypes';
 import HtmlReportGenerator from './HTMLReports';
 import { IQbjObject, IQbjRefPointer, IYftDataModelObject, IYftFileObject } from './Interfaces';
 import { Match } from './Match';
+import {
+  IPairingGenerationOutcome,
+  PairingGenerationMode,
+  ScheduledGameBusyLookup,
+  generatePairingsForPhase,
+} from './PairingGeneration';
 import { IQbjPhase, Phase, PhaseTypes } from './Phase';
 import { Player } from './Player';
 import { Pool } from './Pool';
+import { ScheduledGame } from './ScheduledGame';
 import { QbjAudience, QbjContent, QbjLevel, QbjTypeNames } from './QbjEnums';
 import { IQbjRanking, OverallRanking, Ranking } from './Ranking';
 import Registration, { IQbjRegistration } from './Registration';
@@ -151,6 +158,17 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
   /** Hook used by TournamentManager's existing dirty-state mechanism. */
   // eslint-disable-next-line class-methods-use-this
   onTournamentIdCreated: () => void = () => {};
+
+  /**
+   * Says whether a scheduled game is live in a room, so pairing generation can refuse to disturb it.
+   *
+   * A hook rather than a lookup this class performs itself, because room and session state is
+   * deliberately not tournament data - it lives in the QBTCP adapter, outside the .yft. The default
+   * answers "nothing is live", which is correct for a tournament with no adapter attached and for
+   * every unit test.
+   */
+  // eslint-disable-next-line class-methods-use-this
+  scheduledGameIsBusy: ScheduledGameBusyLookup = () => undefined;
 
   /** Whether we should use question-by-question data from qbj/MODAQ files. Is always false until we develop features that use it. */
   readonly useQuestionLevelData = false;
@@ -730,15 +748,20 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
     } else {
       this.addUnseededTeamToPrelims(newTeam);
     }
+    this.refreshTemplatePairings();
   }
 
   deleteTeamFromSeeds(deletedTeam: Team) {
     this.seeds = this.seeds.filter((tm) => tm !== deletedTeam);
     const prelimPhase = this.getPrelimPhase();
     if (prelimPhase) prelimPhase.removeTeam(deletedTeam);
+    // Unconditional, and before anything is regenerated: a pairing naming a team that no longer
+    // exists would be offered in Rooms and would build an assignment for a team with no roster.
+    this.removeScheduledGamesWithTeam(deletedTeam);
     if (!this.prelimSeedsReadOnly()) {
       this.distributeSeeds();
     }
+    this.refreshTemplatePairings();
   }
 
   /** Add all teams in a registration to the list of seeds, if they aren't already there */
@@ -836,6 +859,73 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
     this.hasMatchData = this.getPrelimPhase()?.anyMatchesExist() || false;
   }
 
+  // --- scheduled games -------------------------------------------------------------------------
+  //
+  // Note what is absent: nothing here feeds hasMatchData, the stat compilation, or any validation.
+  // A tournament with a complete schedule and no results still has no match data, which is what
+  // keeps the scoring rules editable until somebody actually enters a game.
+
+  getAllScheduledGames(): ScheduledGame[] {
+    return this.phases.map((ph) => ph.getAllScheduledGames()).flat();
+  }
+
+  anyScheduledGamesExist() {
+    return !!this.phases.find((ph) => ph.anyScheduledGamesExist());
+  }
+
+  /**
+   * Find a scheduled game anywhere in the tournament by its identity.
+   *
+   * This is the lookup the whole assignment/result path uses: an id read off a returning QBJ Match
+   * comes here to be resolved, whether it arrived over the network or in a file a scorekeeper carried
+   * across the building.
+   */
+  findScheduledGameById(id: string): { game: ScheduledGame; round: Round; phase: Phase } | undefined {
+    if (!id) return undefined;
+    for (const phase of this.phases) {
+      const found = phase.findScheduledGameById(id);
+      if (found) return { ...found, phase };
+    }
+    return undefined;
+  }
+
+  /**
+   * Generate pairings for pools whose membership is now known.
+   *
+   * Called at the moments pool assignment changes rather than on a schedule or a render, and only for
+   * template schedules - a custom schedule's pairings are the director's, generated on request from
+   * the Schedule page. `ReplaceGenerated` means a reseeding rewrites what this generator produced and
+   * leaves anything hand-made or live alone. See PairingGeneration.
+   */
+  refreshTemplatePairings(): IPairingGenerationOutcome | undefined {
+    if (!this.usingScheduleTemplate) return undefined;
+    return this.generatePairings(PairingGenerationMode.ReplaceGenerated);
+  }
+
+  /** Run pairing generation over every full phase. */
+  generatePairings(mode: PairingGenerationMode): IPairingGenerationOutcome {
+    const combined: IPairingGenerationOutcome = { gamesCreated: 0, gamesRemoved: 0, skipped: [] };
+    for (const phase of this.getFullPhases()) {
+      const outcome = generatePairingsForPhase(phase, { mode, isBusy: this.scheduledGameIsBusy });
+      combined.gamesCreated += outcome.gamesCreated;
+      combined.gamesRemoved += outcome.gamesRemoved;
+      combined.skipped.push(...outcome.skipped);
+    }
+    return combined;
+  }
+
+  /** Run pairing generation for one phase, at a director's explicit request. */
+  generatePairingsForOnePhase(phase: Phase, mode: PairingGenerationMode): IPairingGenerationOutcome {
+    return generatePairingsForPhase(phase, { mode, isBusy: this.scheduledGameIsBusy });
+  }
+
+  /** Drop every pairing naming this team, across the whole tournament. */
+  removeScheduledGamesWithTeam(team: Team) {
+    for (const phase of this.phases) {
+      phase.removeScheduledGamesWithTeam(team);
+    }
+  }
+
   /** Should we allow the user to move teams between prelim pools? */
   prelimSeedsReadOnly() {
     const secondPhase = this.getFullPhases()[1];
@@ -866,8 +956,11 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
 
   setStandardSchedule(sched: StandardSchedule) {
     this.phases = sched.constructPhases();
-    this.distributeSeeds();
     this.usingScheduleTemplate = true;
+    // distributeSeeds fills the pools and then generates the pairings for whichever of them are
+    // complete. The template says how many round robins each pool plays; the pairings themselves
+    // wait until the pools actually hold teams, which for a partly-registered field is a later call.
+    this.distributeSeeds();
   }
 
   unlockCustomSchedule() {
@@ -880,6 +973,7 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
   /** Take the list of seeds and populate prelim pools with them */
   distributeSeeds() {
     this.getPrelimPhase()?.setTeamList(this.seeds);
+    this.refreshTemplatePairings();
   }
 
   /** The list of teams not assigned to any pool in the given phase */

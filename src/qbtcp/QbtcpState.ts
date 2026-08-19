@@ -40,7 +40,15 @@ export interface IRoomAssignment {
   roundNumber: number;
   leftTeamId: string;
   rightTeamId: string;
-  /** Stable identity for this scheduled game. Becomes `Match.id`, and comes back on the result. */
+  /**
+   * Stable identity for the game being scored. Becomes `Match.id`, and comes back on the result.
+   *
+   * For an ordinary assignment this is the tournament's ScheduledGame id, so the result names the
+   * pairing it was scored against rather than a game invented when the room was assigned. A manual
+   * assignment - a tiebreaker, an odd final, a pool of arbitrary matchups - has no pairing to name, so
+   * the renderer mints an opaque id for it instead. Either way this server treats it as an opaque
+   * string and only ever compares it for equality.
+   */
   matchId: string;
   /** Which issue of this round's pairings. Increases when an assignment is changed. */
   revision: number;

@@ -46,7 +46,13 @@ export interface IAssignmentBuildRequest {
   round: Round;
   leftTeam: Team;
   rightTeam: Team;
-  /** Stable identity for this scheduled game; becomes `Match.id` and returns on the result. */
+  /**
+   * Stable identity for this game; becomes `Match.id` and returns on the result.
+   *
+   * The tournament's ScheduledGame id when the game being assigned is a scheduled one, which is what
+   * lets a returning result - over the network or as the file a room scored offline from - be matched
+   * back to the pairing rather than guessed at from its teams and round.
+   */
   matchId: string;
   /** Display name of the room. Becomes `Match.location`. */
   roomName: string;
