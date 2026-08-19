@@ -493,6 +493,41 @@ export class Phase implements IQbjPhase, IYftDataModelObject {
     return this.rounds.find((rd) => rd.scheduledGames.includes(game));
   }
 
+  /** Every pairing in this phase that names this team, with the round holding it. */
+  findScheduledGamesWithTeam(team: Team): { game: ScheduledGame; round: Round }[] {
+    const found: { game: ScheduledGame; round: Round }[] = [];
+    for (const rd of this.rounds) {
+      for (const game of rd.findScheduledGamesWithTeam(team)) {
+        found.push({ game, round: rd });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Rename a pool, keeping its pairings attached to it.
+   *
+   * `ScheduledGame.poolName` is a copy of the pool's display name, so renaming the pool alone would
+   * leave every pairing pointing at a name nothing answers to. Generation would then see a pool with
+   * no pairings and write a second set beside the first, and the director would find each of their
+   * teams playing twice a round.
+   *
+   * The pairings are found by their old name before it changes, and only their `poolName` is written:
+   * ids, teams, rounds, hand-edited state and anything a room is holding are all untouched, because a
+   * rename is a change to a label and nothing else.
+   */
+  renamePool(pool: Pool, newName: string) {
+    const oldName = pool.name;
+    pool.name = newName;
+    if (oldName === newName || oldName === '') return;
+
+    for (const rd of this.rounds) {
+      for (const game of rd.scheduledGames) {
+        if (game.poolName === oldName) game.poolName = newName;
+      }
+    }
+  }
+
   /** Drop every pairing naming this team. Used when a team leaves the tournament. */
   removeScheduledGamesWithTeam(team: Team) {
     for (const rd of this.rounds) {

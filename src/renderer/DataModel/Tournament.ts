@@ -7,10 +7,12 @@ import HtmlReportGenerator from './HTMLReports';
 import { IQbjObject, IQbjRefPointer, IYftDataModelObject, IYftFileObject } from './Interfaces';
 import { Match } from './Match';
 import {
+  IPairingGenerationOptions,
   IPairingGenerationOutcome,
   PairingGenerationMode,
   ScheduledGameBusyLookup,
   generatePairingsForPhase,
+  scheduledGameLockReason,
 } from './PairingGeneration';
 import { IQbjPhase, Phase, PhaseTypes } from './Phase';
 import { Player } from './Player';
@@ -902,11 +904,24 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
     return this.generatePairings(PairingGenerationMode.ReplaceGenerated);
   }
 
+  /**
+   * Generate pairings for one phase whose pool membership has just changed.
+   *
+   * The narrow counterpart to `refreshTemplatePairings`, for the rebracketing path. Playoff pools are
+   * populated long after the prelim pools are, and running every phase's generation each time a
+   * playoff pool gains a team would keep re-deciding prelims that were settled weeks of tournament
+   * time ago. Same rules, same protections - one phase.
+   */
+  refreshTemplatePairingsForPhase(phase: Phase): IPairingGenerationOutcome | undefined {
+    if (!this.usingScheduleTemplate) return undefined;
+    return this.generatePairingsForOnePhase(phase, PairingGenerationMode.ReplaceGenerated);
+  }
+
   /** Run pairing generation over every full phase. */
   generatePairings(mode: PairingGenerationMode): IPairingGenerationOutcome {
     const combined: IPairingGenerationOutcome = { gamesCreated: 0, gamesRemoved: 0, skipped: [] };
     for (const phase of this.getFullPhases()) {
-      const outcome = generatePairingsForPhase(phase, { mode, isBusy: this.scheduledGameIsBusy });
+      const outcome = generatePairingsForPhase(phase, this.pairingGenerationOptions(phase, mode));
       combined.gamesCreated += outcome.gamesCreated;
       combined.gamesRemoved += outcome.gamesRemoved;
       combined.skipped.push(...outcome.skipped);
@@ -916,7 +931,18 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
 
   /** Run pairing generation for one phase, at a director's explicit request. */
   generatePairingsForOnePhase(phase: Phase, mode: PairingGenerationMode): IPairingGenerationOutcome {
-    return generatePairingsForPhase(phase, { mode, isBusy: this.scheduledGameIsBusy });
+    return generatePairingsForPhase(phase, this.pairingGenerationOptions(phase, mode));
+  }
+
+  /**
+   * Everything outside the pool structure that generation needs to know about this phase.
+   *
+   * The two pieces the data model cannot answer from the phase alone: which pairings a room is using,
+   * which lives in the Rooms adapter, and which games have been carried into this phase, which lives
+   * on the Match objects of the phases before it.
+   */
+  private pairingGenerationOptions(phase: Phase, mode: PairingGenerationMode): IPairingGenerationOptions {
+    return { mode, isBusy: this.scheduledGameIsBusy, carryoverMatches: this.getCarryoverMatches(phase) };
   }
 
   /** Drop every pairing naming this team, across the whole tournament. */
@@ -924,6 +950,39 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
     for (const phase of this.phases) {
       phase.removeScheduledGamesWithTeam(team);
     }
+  }
+
+  /** Every pairing naming this team, anywhere in the tournament, with the round and phase holding it. */
+  scheduledGamesForTeam(team: Team): { game: ScheduledGame; round: Round; phase: Phase }[] {
+    const found: { game: ScheduledGame; round: Round; phase: Phase }[] = [];
+    for (const phase of this.phases) {
+      for (const entry of phase.findScheduledGamesWithTeam(team)) {
+        found.push({ ...entry, phase });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Why deleting this team would take a pairing that is in use with it, or undefined if none is.
+   *
+   * Deleting a team removes every pairing that names it. That is right for a schedule nobody has
+   * started on, and wrong the moment a room is holding one of them: the pairing's id is what the
+   * QBTCP session, the assignment served to the room and any result on its way back are all keyed on,
+   * so removing it would leave a room scoring a game the tournament no longer contains and a returning
+   * result with nothing to resolve against.
+   *
+   * The lock is the same `scheduledGameLockReason` the pairing editor and the Rooms page use, so a
+   * game that cannot be deleted on the Schedule page cannot be deleted out from under itself here
+   * either. Deletion is refused rather than made partial - taking the safe pairings and leaving the
+   * busy ones behind would delete the team and leave pairings naming a team that no longer exists.
+   */
+  teamScheduledGameDeletionBlockReason(team: Team): string | undefined {
+    for (const { game, round } of this.scheduledGamesForTeam(team)) {
+      const reason = scheduledGameLockReason(game, round, this.scheduledGameIsBusy);
+      if (reason) return `${game.displayName()} in ${round.displayName()} cannot be removed because ${reason}`;
+    }
+    return undefined;
   }
 
   /** Should we allow the user to move teams between prelim pools? */

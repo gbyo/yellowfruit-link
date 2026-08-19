@@ -7,6 +7,7 @@
  *
  * The four teams are the ones from the worked example: Tiger, Lion, Leopard, Jaguar.
  */
+import { Match } from '../renderer/DataModel/Match';
 import { Phase, PhaseTypes } from '../renderer/DataModel/Phase';
 import { Player } from '../renderer/DataModel/Player';
 import { Pool } from '../renderer/DataModel/Pool';
@@ -17,6 +18,7 @@ import StandardSchedule from '../renderer/DataModel/StandardSchedule';
 import { Team } from '../renderer/DataModel/Team';
 import Tournament from '../renderer/DataModel/Tournament';
 import { ScheduledGame } from '../renderer/DataModel/ScheduledGame';
+import { Sched12Teams8Rounds } from '../renderer/DataModel/Schedules/12-team';
 
 export const bigCatNames = ['Tiger', 'Lion', 'Leopard', 'Jaguar'];
 
@@ -192,4 +194,135 @@ export function applyCustomTwelveRoundSchedule(tournament: Tournament) {
     }
   });
   return phase;
+}
+
+// --- carryover fixtures --------------------------------------------------------------------------
+//
+// The 12-team, 8-round template is the case the carryover work exists for: two prelim pools of six
+// over five rounds, then two playoff pools of six over *three*, because half of each playoff pool's
+// round robin was already played in prelims. These helpers build that tournament the way a director
+// would - apply the template, register twelve teams, play the prelims, rebracket - so the tests are
+// asserting about the shipped schedule rather than about a fixture invented to suit them.
+
+export const twelveTeamNames = [
+  'Tiger',
+  'Lion',
+  'Leopard',
+  'Jaguar',
+  'Puma',
+  'Ocelot',
+  'Caracal',
+  'Serval',
+  'Lynx',
+  'Cheetah',
+  'Margay',
+  'Kodkod',
+];
+
+/** The 12-team / 8-round template with its teams registered and nothing played yet. */
+export function makeTwelveTeamCarryoverTournament(): Tournament {
+  return makeTemplateTournament(Sched12Teams8Rounds, twelveTeamNames);
+}
+
+/**
+ * Enter a game for every pairing in a phase, with the team on the left winning.
+ *
+ * Real Match objects carrying the scheduled game's id, which is what an accepted result produces.
+ * The scoreline is arbitrary but deterministic, so the standings - and therefore the rebracketing -
+ * come out the same every run.
+ */
+export function playScheduledGames(tournament: Tournament, phase: Phase) {
+  for (const round of phase.rounds) {
+    for (const game of round.scheduledGames.slice()) {
+      const match = new Match(game.leftTeam, game.rightTeam, tournament.scoringRules.answerTypes);
+      match.scheduledGameId = game.id;
+      match.tossupsRead = tournament.scoringRules.regulationTossupCount;
+      match.leftTeam.points = 300;
+      match.rightTeam.points = 200;
+      round.addMatch(match);
+    }
+  }
+  tournament.calcHasMatchData();
+}
+
+/**
+ * Put the playoff pools together and carry the prelim games into them.
+ *
+ * The top half of each prelim pool goes to the top playoff pool and the bottom half to the other,
+ * which is what the template's advancement rules say. Carryover is then applied by the tournament's
+ * own `carryOverMatches`, so what the tests see is the real carryover record rather than a marking
+ * invented here.
+ */
+export function rebracketIntoCarryoverPools(tournament: Tournament) {
+  const [prelims, playoffs] = tournament.phases;
+  const half = prelims.pools[0].poolTeams.length / 2;
+
+  for (const prelimPool of prelims.pools) {
+    const teams = prelimPool.poolTeams.map((pt) => pt.team);
+    teams.slice(0, half).forEach((team) => playoffs.pools[0].addTeam(team));
+    teams.slice(half).forEach((team) => playoffs.pools[1].addTeam(team));
+  }
+  for (const playoffPool of playoffs.pools) {
+    tournament.carryOverMatches(
+      playoffs,
+      playoffPool.poolTeams.map((pt) => pt.team),
+    );
+  }
+  return playoffs;
+}
+
+/** Sorted "Jaguar|Lion" keys for every pairing in a phase, so meetings can be counted. */
+export function meetingKeysInPhase(phase: Phase): string[] {
+  return phase.rounds.flatMap((round) =>
+    round.scheduledGames.map((game) => [game.leftTeam.name, game.rightTeam.name].sort().join('|')),
+  );
+}
+
+/** The unordered pairs that were carried into this phase, as the same sorted keys. */
+export function carriedOverMeetingKeys(tournament: Tournament, phase: Phase): string[] {
+  return tournament.getCarryoverMatches(phase).map((match) => {
+    const names = [match.leftTeam.team?.name ?? '', match.rightTeam.team?.name ?? ''];
+    return names.sort().join('|');
+  });
+}
+
+/**
+ * A small hand-built tournament whose playoff pool carries exactly one game in.
+ *
+ * The 12-team template covers the realistic case; this one exists to make the arithmetic of repeated
+ * round robins checkable by eye. Four teams in a playoff pool declaring `roundRobins` cycles, of
+ * which Tiger and Lion have already met once in prelims.
+ */
+export function makeSingleCarryoverGameTournament(roundRobins: number, playoffRounds: number) {
+  const tournament = new Tournament('Carryover Custom');
+  tournament.scoringRules.applyRuleSet(CommonRuleSets.AcfPowers);
+  tournament.usingScheduleTemplate = false;
+  // Registered before any phase exists, so nothing is auto-assigned to a pool we are about to build.
+  addBigCats(tournament);
+  const teams = bigCatNames.map((name) => teamNamed(tournament, name));
+  const [tiger, lion] = teams;
+
+  const prelims = new Phase(PhaseTypes.Prelim, 1, 1, '1');
+  const prelimPool = new Pool(2, 1, 'Prelim A');
+  prelimPool.addTeam(tiger);
+  prelimPool.addTeam(lion);
+  prelims.pools = [prelimPool];
+
+  const playoffs = new Phase(PhaseTypes.Playoff, 2, playoffRounds + 1, '2');
+  const championship = new Pool(4, 1, 'Championship', true);
+  championship.roundRobins = roundRobins;
+  teams.forEach((team) => championship.addTeam(team));
+  playoffs.pools = [championship];
+
+  tournament.phases = [prelims, playoffs];
+
+  // The one prelim game, and the tournament's own carryover marking of it.
+  const match = new Match(tiger, lion, tournament.scoringRules.answerTypes);
+  match.tossupsRead = tournament.scoringRules.regulationTossupCount;
+  match.leftTeam.points = 300;
+  match.rightTeam.points = 200;
+  prelims.rounds[0].addMatch(match);
+  tournament.carryOverMatches(playoffs, teams);
+
+  return { tournament, prelims, playoffs, championship, carriedOverMatch: match };
 }

@@ -86,7 +86,14 @@ export default class TempPoolManager {
 
   saveData() {
     if (!this.originalPoolOpened) return;
-    this.originalPoolOpened.name = this.poolName;
+    // Through the phase rather than straight onto the pool: `ScheduledGame.poolName` is a copy of this
+    // name, and a rename that leaves those behind detaches the pool from its own pairings. See
+    // Phase.renamePool.
+    if (this.phaseContainingPool) {
+      this.phaseContainingPool.renamePool(this.originalPoolOpened, this.poolName);
+    } else {
+      this.originalPoolOpened.name = this.poolName;
+    }
     if (this.numTeams !== undefined) this.originalPoolOpened.size = this.numTeams;
     if (this.numRoundRobins !== undefined) this.originalPoolOpened.roundRobins = this.numRoundRobins;
     this.originalPoolOpened.hasCarryover = this.hasCarryover;
