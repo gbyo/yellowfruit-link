@@ -164,3 +164,31 @@ test('a legacy state without scoresheetUrl still loads unchanged', async () => {
   expect(loaded.state.stateVersion).toBe(1);
   expect(defaultScoresheetUrl).toBe('https://qbsheet.com/');
 });
+
+test('help requests survive restart and a pre-help state loads with an empty request list', async () => {
+  const store = await newStore();
+  const state = emptyQbtcpState('help-tournament');
+  state.helpRequests.push({
+    id: 'help-1',
+    roomId: 'room-1',
+    roomName: 'Room 1',
+    category: 'equipment-technical',
+    message: 'The buzzer is not responding.',
+    status: 'open',
+    createdAt: '2026-08-19T12:00:00.000Z',
+    updatedAt: '2026-08-19T12:00:00.000Z',
+    deviceId: 'chromebook-1',
+  });
+
+  await store.save(state);
+  const loaded = await store.load('help-tournament');
+  expect(loaded.problem).toBeUndefined();
+  expect(loaded.state.helpRequests).toEqual(state.helpRequests);
+
+  const legacyState: Partial<ReturnType<typeof emptyQbtcpState>> = emptyQbtcpState('pre-help-tournament');
+  delete legacyState.helpRequests;
+  await writeRawState(store, 'pre-help-tournament', legacyState);
+  const legacyLoaded = await store.load('pre-help-tournament');
+  expect(legacyLoaded.problem).toBeUndefined();
+  expect(legacyLoaded.state.helpRequests).toEqual([]);
+});

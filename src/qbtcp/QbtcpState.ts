@@ -14,6 +14,7 @@
  * QBTCP state file in the app-data directory, and they must never reach a QBJ document, a log line,
  * or the renderer's view of a room. `IRoomView` below is the redacted shape the renderer is given.
  */
+import { QbtcpHelpCategory } from './QbtcpProtocol';
 
 /** A scoring position in the tournament. The unit that pairs and authenticates. */
 export interface IRoom {
@@ -135,6 +136,40 @@ export interface IPresence {
   lastSeenAt: string;
 }
 
+export type HelpRequestStatus = 'open' | 'cancelled' | 'resolved';
+
+/** One scorekeeper's request for tournament control to come to the room. */
+export interface IQbtcpHelpRequest {
+  id: string;
+  roomId: string;
+  roomName: string;
+  category: QbtcpHelpCategory;
+  message: string;
+  status: HelpRequestStatus;
+  createdAt: string;
+  updatedAt: string;
+  deviceId?: string;
+  operatorName?: string;
+  currentMatchup?: {
+    roundNumber: number;
+    roundName: string;
+    leftTeam: string;
+    rightTeam: string;
+  };
+}
+
+/** Validated request passed from the HTTP server to the tournament-owning renderer. */
+export interface IQbtcpRosterPlayerRequest {
+  requestId: string;
+  roomId: string;
+  sessionId: string;
+  teamId: string;
+  teamName: string;
+  playerName: string;
+}
+
+export type QbtcpRosterPlayerOutcome = { ok: true } | { ok: false; error: string; status?: 409 | 503 };
+
 /** The whole persisted operational state for one tournament. */
 export interface IQbtcpTournamentState {
   /** Schema version of this file, so a later build can migrate or refuse it. */
@@ -148,6 +183,7 @@ export interface IQbtcpTournamentState {
   sessions: ISession[];
   results: IReceivedResult[];
   presence: IPresence[];
+  helpRequests: IQbtcpHelpRequest[];
 }
 
 export const qbtcpStateVersion = 1;
@@ -161,6 +197,7 @@ export function emptyQbtcpState(tournamentId: string): IQbtcpTournamentState {
     sessions: [],
     results: [],
     presence: [],
+    helpRequests: [],
   };
 }
 
@@ -203,6 +240,8 @@ export interface IRoomView {
     fingerprint: string;
     receivedAt: string;
   };
+  /** Open requests only. Closed history stays in the main process. */
+  helpRequests?: IQbtcpHelpRequest[];
 }
 
 /** Server status as shown on the Rooms page. */

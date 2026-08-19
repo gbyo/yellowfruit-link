@@ -67,6 +67,8 @@ export enum IpcMainToRend {
   QbtcpResultReceived = 'QbtcpResultReceived',
   /** Room presence/session/progress changed; the Rooms page should refresh its status. */
   QbtcpStateChanged = 'QbtcpStateChanged',
+  /** Authenticated QBSheet request to add a player to the open tournament. */
+  QbtcpRosterPlayerRequested = 'QbtcpRosterPlayerRequested',
 }
 
 /** Channels for both directions renderer<-->main */
@@ -114,6 +116,7 @@ export const rendererListenableEvents = [
   IpcMainToRend.ImportQbjGamesMainLaunch,
   IpcMainToRend.QbtcpResultReceived,
   IpcMainToRend.QbtcpStateChanged,
+  IpcMainToRend.QbtcpRosterPlayerRequested,
   IpcMainToRend.LaunchAboutYf,
   IpcBidirectional.LoadBackup,
   IpcBidirectional.ExportQbjFile,

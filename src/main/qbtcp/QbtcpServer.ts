@@ -42,6 +42,7 @@ import {
   operatorNameHeader,
   pairingRateLimit,
   presenceFreshMs,
+  qbtcpHelpCategories,
   qbjMediaType,
   qbjVersion,
   qbtcpPrefix,
@@ -53,8 +54,11 @@ import {
   IReceivedResult,
   IRoom,
   IRoomAssignment,
+  IQbtcpHelpRequest,
+  IQbtcpRosterPlayerRequest,
   ISession,
   ISessionGrant,
+  QbtcpRosterPlayerOutcome,
   emptyQbtcpState,
 } from '../../qbtcp/QbtcpState';
 import {
@@ -83,12 +87,15 @@ import {
 /** Escaped so a future protocol prefix cannot be interpreted as a regular expression. */
 const escapedQbtcpPrefix = qbtcpPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const sessionRoutePattern = new RegExp(`^${escapedQbtcpPrefix}/sessions/([^/]+)/(writer|progress|result|recovery)$`);
+const helpRoutePattern = new RegExp(`^${escapedQbtcpPrefix}/help/([^/]+)$`);
 
 export interface IQbtcpServerHooks {
   /** A final was received and is durably stored. The renderer runs the shared importer from here. */
   onResultReceived: (result: IReceivedResult) => void;
   /** Something a director would want to see changed: presence, a session, a snapshot. */
   onStateChanged: () => void;
+  /** Apply QBSheet's authenticated live roster addition to the renderer-owned tournament. */
+  onRosterPlayerRequested?: (request: IQbtcpRosterPlayerRequest) => Promise<QbtcpRosterPlayerOutcome>;
 }
 
 export default class QbtcpServer {
@@ -313,6 +320,9 @@ export default class QbtcpServer {
     ) {
       return { removed: false, reason: 'This room has a result waiting for review.' };
     }
+    if (this.state.helpRequests.some((request) => request.roomId === roomId && request.status === 'open')) {
+      return { removed: false, reason: 'This room has an open help request. Resolve it before removing the room.' };
+    }
     this.state.rooms = this.state.rooms.filter((room) => room.id !== roomId);
     this.state.sessions = this.state.sessions.filter((session) => session.roomId !== roomId);
     this.state.presence = this.state.presence.filter((entry) => entry.roomId !== roomId);
@@ -392,6 +402,16 @@ export default class QbtcpServer {
     await this.store.save(this.state);
   }
 
+  /** Mark an open request dealt with from the Rooms page. */
+  async resolveHelpRequest(requestId: string): Promise<void> {
+    const request = this.state.helpRequests.find((entry) => entry.id === requestId && entry.status === 'open');
+    if (!request) return;
+    request.status = 'resolved';
+    request.updatedAt = new Date().toISOString();
+    await this.store.save(this.state);
+    this.hooks.onStateChanged();
+  }
+
   /** Results the renderer has not yet turned into a decision. Used to re-offer them after a restart. */
   unresolvedResults(): IReceivedResult[] {
     return this.state.results
@@ -416,11 +436,21 @@ export default class QbtcpServer {
     return tournamentId !== undefined && tournamentId !== this.state.tournamentId;
   }
 
-  private compareOne(identity: { matchId?: string; fingerprint: string; tournamentId?: string }): ResultComparison {
+  private compareOne(
+    identity: { matchId?: string; fingerprint: string; tournamentId?: string },
+    reviewingResultId?: string,
+  ): ResultComparison {
     if (this.belongsToAnotherTournament(identity.tournamentId)) return { kind: 'new' };
     return compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
-      this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
+      this.state.results
+        .filter(
+          (result) =>
+            result.id !== reviewingResultId ||
+            result.fingerprint !== identity.fingerprint ||
+            (result.status !== 'needs-review' && result.status !== 'conflict'),
+        )
+        .map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
     );
   }
 
@@ -434,8 +464,8 @@ export default class QbtcpServer {
    * and one answer applied to all of them would mark nine new games as duplicates because the tenth
    * was one.
    */
-  classifyResults(document: object): ResultComparison[] {
-    return readResultIdentities(document).map((identity) => this.compareOne(identity));
+  classifyResults(document: object, reviewingResultId?: string): ResultComparison[] {
+    return readResultIdentities(document).map((identity) => this.compareOne(identity, reviewingResultId));
   }
 
   /**
@@ -482,6 +512,11 @@ export default class QbtcpServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const cors = applyCors(request, response, this.allowedOrigins);
 
+    if (urlTooLong(request)) {
+      sendJson(response, 414, { error: 'That request address was too long.' });
+      return;
+    }
+
     if (request.method === 'OPTIONS') {
       // Preflight is answered for every path, and refused for an origin outside the allowlist.
       if (!cors.allowed) {
@@ -494,11 +529,6 @@ export default class QbtcpServer {
 
     if (!cors.allowed) {
       sendJson(response, 403, { error: 'This browser origin is not approved.', code: 'origin_not_allowed' });
-      return;
-    }
-
-    if (urlTooLong(request)) {
-      sendJson(response, 414, { error: 'That request address was too long.' });
       return;
     }
 
@@ -516,18 +546,29 @@ export default class QbtcpServer {
 
   private async route(path: string, method: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
     // --- discovery: no credential, and it reveals no schedule, room list, or pairing code -------
-    if (path === qbtcpPrefix && method === 'GET') {
+    if (path === qbtcpPrefix) {
+      if (method !== 'GET') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       sendJson(response, 200, {
         protocol: 'QBTCP',
         version: 1,
-        capabilities: [...advertisedCapabilities],
+        capabilities: advertisedCapabilities.filter(
+          (capability) => capability !== 'roster' || this.hooks.onRosterPlayerRequested !== undefined,
+        ),
+        help_categories: [...qbtcpHelpCategories],
         qbj_version: qbjVersion,
         name: this.tournamentName,
       });
       return;
     }
 
-    if (path === `${qbtcpPrefix}/rooms` && method === 'GET') {
+    if (path === `${qbtcpPrefix}/rooms`) {
+      if (method !== 'GET') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       // This is pre-pairing discovery: QBSheet uses the names to show a room picker before it has a
       // credential. The response contains no token or pairing code; the pairing endpoint still keeps
       // its identical-failure oracle protection.
@@ -537,19 +578,31 @@ export default class QbtcpServer {
       return;
     }
 
-    if (path === `${qbtcpPrefix}/pair` && method === 'POST') {
+    if (path === `${qbtcpPrefix}/pair`) {
+      if (method !== 'POST') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       await this.handlePair(request, response);
       return;
     }
 
-    if (path === `${qbtcpPrefix}/assignment/status` && method === 'GET') {
+    if (path === `${qbtcpPrefix}/assignment/status`) {
+      if (method !== 'GET') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       const room = this.authorizeRoom(request, response);
       if (!room) return;
       this.sendAssignmentStatus(room, response);
       return;
     }
 
-    if (path === `${qbtcpPrefix}/assignment` && method === 'GET') {
+    if (path === `${qbtcpPrefix}/assignment`) {
+      if (method !== 'GET') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       const room = this.authorizeRoom(request, response);
       if (!room) return;
       const assignment = this.state.assignments.find((a) => a.roomId === room.id);
@@ -562,12 +615,20 @@ export default class QbtcpServer {
       return;
     }
 
-    if (path === `${qbtcpPrefix}/sessions` && method === 'POST') {
+    if (path === `${qbtcpPrefix}/sessions`) {
+      if (method !== 'POST') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       await this.handleOpenSession(request, response);
       return;
     }
 
     if (path === `${qbtcpPrefix}/presence`) {
+      if (method !== 'GET' && method !== 'POST') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
       const room = this.authorizeRoom(request, response);
       if (!room) return;
       if (method === 'POST') {
@@ -584,13 +645,61 @@ export default class QbtcpServer {
         });
         return;
       }
-      sendJson(response, 405, { error: 'Method not allowed.' });
+    }
+
+    if (path === `${qbtcpPrefix}/help`) {
+      if (method !== 'GET' && method !== 'POST') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
+      const room = this.authorizeRoom(request, response);
+      if (!room) return;
+      if (method === 'GET') {
+        this.sendOpenHelpRequest(room, request, response);
+      } else {
+        await this.handleHelpPost(room, request, response);
+      }
+      return;
+    }
+
+    const helpRoute = helpRoutePattern.exec(path);
+    if (helpRoute) {
+      if (method !== 'DELETE') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
+      const room = this.authorizeRoom(request, response);
+      if (!room) return;
+      let helpRequestId: string;
+      try {
+        helpRequestId = decodeURIComponent(helpRoute[1]);
+      } catch {
+        sendJson(response, 400, { error: 'That help request address is malformed.' });
+        return;
+      }
+      await this.handleHelpDelete(room, helpRequestId, request, response);
+      return;
+    }
+
+    if (path === `${qbtcpPrefix}/roster/players`) {
+      if (method !== 'POST') {
+        sendJson(response, 405, { error: 'Method not allowed.' });
+        return;
+      }
+      await this.handleRosterPlayer(request, response);
       return;
     }
 
     const sessionRoute = sessionRoutePattern.exec(path);
     if (sessionRoute) {
-      await this.handleSessionRoute(decodeURIComponent(sessionRoute[1]), sessionRoute[2], method, request, response);
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(sessionRoute[1]);
+      } catch {
+        sendJson(response, 400, { error: 'That session address is malformed.' });
+        return;
+      }
+      await this.handleSessionRoute(sessionId, sessionRoute[2], method, request, response);
       return;
     }
 
@@ -725,6 +834,7 @@ export default class QbtcpServer {
       session: session ? { session_id: session.id, resumable: !session.finalReceived } : null,
       ...(assignment ? { released_round: assignment.roundNumber } : {}),
       hold_new_starts: false,
+      previous: null,
       next: null,
     });
   }
@@ -812,11 +922,17 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
+    const expectedMethod = { recovery: 'GET', writer: 'POST', progress: 'PUT', result: 'POST' }[kind];
+    if (method !== expectedMethod) {
+      sendJson(response, 405, { error: 'Method not allowed.' });
+      return;
+    }
+
     const authorized = this.authorizeSession(sessionId, request, response);
     if (!authorized) return;
     const { session, grant } = authorized;
 
-    if (kind === 'recovery' && method === 'GET') {
+    if (kind === 'recovery') {
       const assignment = this.state.assignments.find((a) => a.matchId === session.matchId);
       // Deliberately camelCase: this is the shape the client reads for recovery on both surfaces.
       sendJson(response, 200, {
@@ -830,22 +946,22 @@ export default class QbtcpServer {
       return;
     }
 
-    if (kind === 'writer' && method === 'POST') {
+    if (kind === 'writer') {
       await this.handleWriterTakeover(session, grant, request, response);
       return;
     }
 
-    if (kind === 'progress' && method === 'PUT') {
+    if (kind === 'progress') {
       await this.handleProgress(session, grant, request, response);
       return;
     }
 
-    if (kind === 'result' && method === 'POST') {
+    if (kind === 'result') {
       await this.handleResult(session, grant, request, response);
       return;
     }
 
-    sendJson(response, 405, { error: 'Method not allowed.' });
+    sendJson(response, 404, { error: 'Not found.' });
   }
 
   private async handleWriterTakeover(
@@ -993,27 +1109,15 @@ export default class QbtcpServer {
       return;
     }
 
-    const assignment = this.state.assignments.find(
-      (entry) => entry.roomId === session.roomId && entry.matchId === session.matchId,
-    );
-    if (!assignment) {
-      sendJson(response, 409, { error: 'That result no longer belongs to an assigned game.' });
-      return;
-    }
-
-    const assignmentError = validateResultAgainstAssignment(body, assignment);
-    if (assignmentError) {
-      sendJson(response, 409, { error: assignmentError });
-      return;
-    }
-
     const comparison = compareToRecorded(
       { matchId: identity.matchId, fingerprint: identity.fingerprint },
       this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
     );
 
     if (comparison.kind === 'duplicate') {
-      // The correct answer to a retry, and not an error. No second result is recorded.
+      // Idempotence outlives the assignment. A scoresheet may retry after a timeout only after the
+      // director has released this room to its next game; the exact stored result still receives the
+      // same successful acknowledgement instead of becoming a spurious superseded-game error.
       session.finalReceived = true;
       session.updatedAt = new Date().toISOString();
       await this.store.save(this.state);
@@ -1024,6 +1128,18 @@ export default class QbtcpServer {
         duplicate: true,
       });
       this.hooks.onStateChanged();
+      return;
+    }
+
+    const assignment = this.state.assignments.find((entry) => entry.roomId === session.roomId);
+    if (!assignment || assignment.matchId !== session.matchId) {
+      sendJson(response, 410, { error: 'A newer assignment has superseded this game.' });
+      return;
+    }
+
+    const assignmentError = resultAssignmentValidation(body, assignment);
+    if (assignmentError) {
+      sendJson(response, assignmentError.status, { error: assignmentError.error });
       return;
     }
 
@@ -1098,6 +1214,163 @@ export default class QbtcpServer {
     sendJson(response, 200, {});
   }
 
+  // --- help requests --------------------------------------------------------------------------
+
+  private static requestDeviceId(request: IncomingMessage): string | undefined {
+    return stringField(headerValue(request, deviceIdHeader), 256);
+  }
+
+  private openHelpRequest(roomId: string, deviceId?: string): IQbtcpHelpRequest | undefined {
+    return this.state.helpRequests.find(
+      (request) => request.roomId === roomId && request.deviceId === deviceId && request.status === 'open',
+    );
+  }
+
+  private sendOpenHelpRequest(room: IRoom, request: IncomingMessage, response: ServerResponse): void {
+    sendJson(response, 200, { request: this.openHelpRequest(room.id, QbtcpServer.requestDeviceId(request)) ?? null });
+  }
+
+  private async handleHelpPost(room: IRoom, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const body = await this.readJsonBody(request, response);
+    if (body === undefined) return;
+    if (!isPlainObject(body)) {
+      sendJson(response, 400, { error: 'A help request needs a category.' });
+      return;
+    }
+    const category = stringField(body.category, 64);
+    if (!category || !qbtcpHelpCategories.includes(category as (typeof qbtcpHelpCategories)[number])) {
+      sendJson(response, 400, { error: 'That help-request category is not supported.' });
+      return;
+    }
+    if (body.message !== undefined && (typeof body.message !== 'string' || body.message.length > 2000)) {
+      sendJson(response, 400, { error: 'That help-request message is not usable.' });
+      return;
+    }
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+
+    const deviceId = QbtcpServer.requestDeviceId(request);
+    const existing = this.openHelpRequest(room.id, deviceId);
+    if (existing) {
+      sendJson(response, 200, { request: existing });
+      return;
+    }
+
+    const assignment = this.state.assignments.find((entry) => entry.roomId === room.id);
+    const operatorName = stringField(headerValue(request, operatorNameHeader), 256);
+    const now = new Date().toISOString();
+    const helpRequest: IQbtcpHelpRequest = {
+      id: makeOpaqueId('help-', 8),
+      roomId: room.id,
+      roomName: room.name,
+      category: category as IQbtcpHelpRequest['category'],
+      message,
+      status: 'open',
+      createdAt: now,
+      updatedAt: now,
+      ...(deviceId ? { deviceId } : {}),
+      ...(operatorName ? { operatorName } : {}),
+      ...(assignment
+        ? {
+            currentMatchup: {
+              roundNumber: assignment.roundNumber,
+              roundName: `Round ${assignment.roundNumber}`,
+              leftTeam: assignment.leftTeamName,
+              rightTeam: assignment.rightTeamName,
+            },
+          }
+        : {}),
+    };
+    this.state.helpRequests.push(helpRequest);
+    await this.store.save(this.state);
+    this.hooks.onStateChanged();
+    sendJson(response, 200, { request: helpRequest });
+  }
+
+  private async handleHelpDelete(
+    room: IRoom,
+    requestId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const deviceId = QbtcpServer.requestDeviceId(request);
+    const helpRequest = this.state.helpRequests.find(
+      (entry) =>
+        entry.id === requestId && entry.roomId === room.id && entry.deviceId === deviceId && entry.status === 'open',
+    );
+    if (!helpRequest) {
+      // A harmless race with a director resolving it while the scorekeeper clicks cancel.
+      sendJson(response, 200, { request: null });
+      return;
+    }
+    helpRequest.status = 'cancelled';
+    helpRequest.updatedAt = new Date().toISOString();
+    await this.store.save(this.state);
+    this.hooks.onStateChanged();
+    sendJson(response, 200, { request: helpRequest });
+  }
+
+  // --- live roster synchronization -------------------------------------------------------------
+
+  private async handleRosterPlayer(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const room = this.authorizeRoom(request, response);
+    if (!room) return;
+    const body = await this.readJsonBody(request, response);
+    if (body === undefined) return;
+    if (!isPlainObject(body)) {
+      sendJson(response, 400, { error: 'A roster update needs a session, team, and player.' });
+      return;
+    }
+    const sessionId = stringField(body.sessionId, 256);
+    const teamName = stringField(body.teamName, 512);
+    const playerName = stringField(body.playerName, 200);
+    if (!sessionId || !teamName || !playerName) {
+      sendJson(response, 400, { error: 'A roster update needs a session, team, and player.' });
+      return;
+    }
+    const authorized = this.authorizeSession(sessionId, request, response);
+    if (!authorized) return;
+    const { session } = authorized;
+    if (session.roomId !== room.id) {
+      sendJson(response, 403, { error: 'That session does not belong to this room.' });
+      return;
+    }
+    const assignment = this.state.assignments.find((entry) => entry.roomId === room.id);
+    if (!assignment || assignment.matchId !== session.matchId || session.finalReceived) {
+      sendJson(response, 410, { error: 'A newer assignment has superseded this game.' });
+      return;
+    }
+    let teamId: string | undefined;
+    if (teamName === assignment.leftTeamName) teamId = assignment.leftTeamId;
+    if (teamName === assignment.rightTeamName) teamId = assignment.rightTeamId;
+    if (!teamId) {
+      sendJson(response, 409, { error: 'That team is not part of this scoring session.' });
+      return;
+    }
+    if (!this.hooks.onRosterPlayerRequested) {
+      sendJson(response, 501, { error: 'Live roster updates are not available.' });
+      return;
+    }
+
+    let outcome: QbtcpRosterPlayerOutcome;
+    try {
+      outcome = await this.hooks.onRosterPlayerRequested({
+        requestId: makeOpaqueId('roster-', 8),
+        roomId: room.id,
+        sessionId,
+        teamId,
+        teamName,
+        playerName,
+      });
+    } catch {
+      outcome = { ok: false, status: 503, error: 'YellowFruit could not apply that roster update.' };
+    }
+    if (!outcome.ok) {
+      sendJson(response, outcome.status ?? 409, { error: outcome.error });
+      return;
+    }
+    sendJson(response, 200, { added: true, teamName, playerName });
+  }
+
   // --- helpers --------------------------------------------------------------------------------
 
   /**
@@ -1161,21 +1434,29 @@ function originOf(url?: string): string | undefined {
   }
 }
 
-/** Validate the identity and assignment metadata before a final can be compared or stored. */
-export function validateResultAgainstAssignment(body: object, assignment: IRoomAssignment): string | undefined {
+interface IResultAssignmentValidationError {
+  status: 400 | 409 | 410;
+  error: string;
+}
+
+/** Validate the identity and assignment metadata before a final can be stored. */
+function resultAssignmentValidation(
+  body: object,
+  assignment: IRoomAssignment,
+): IResultAssignmentValidationError | undefined {
   const match = findResultMatch(body);
-  if (!match) return 'That result contained no match this server could read.';
+  if (!match) return { status: 400, error: 'That result contained no match this server could read.' };
 
   const rawTeams = match.match_teams ?? match.matchTeams;
   if (!Array.isArray(rawTeams) || rawTeams.length !== 2) {
-    return 'That result does not contain the two teams assigned to this scoring session.';
+    return { status: 409, error: 'That result does not contain the two teams assigned to this scoring session.' };
   }
   const teamIds = rawTeams.map(teamIdFromMatchTeam);
   const hasAllTeamIds = teamIds.every((teamId) => teamId !== undefined);
   const hasNoTeamIds = teamIds.every((teamId) => teamId === undefined);
   if (hasAllTeamIds) {
     if (teamIds[0] !== assignment.leftTeamId || teamIds[1] !== assignment.rightTeamId) {
-      return 'That result does not contain the two teams assigned to this scoring session.';
+      return { status: 409, error: 'That result does not contain the two teams assigned to this scoring session.' };
     }
   } else if (hasNoTeamIds && match === body) {
     const teamNames = rawTeams.map(teamNameFromMatchTeam);
@@ -1184,26 +1465,36 @@ export function validateResultAgainstAssignment(body: object, assignment: IRoomA
       teamNames[1] !== assignment.rightTeamName ||
       teamNames.some((teamName) => teamName === undefined)
     ) {
-      return 'That result does not contain the two teams assigned to this scoring session.';
+      return { status: 409, error: 'That result does not contain the two teams assigned to this scoring session.' };
     }
   } else {
-    return 'That result does not contain the two teams assigned to this scoring session.';
+    return { status: 409, error: 'That result does not contain the two teams assigned to this scoring session.' };
   }
 
   const extension = match._qbtcp;
   let revision: unknown;
   if (extension !== undefined) {
-    if (!isPlainObject(extension)) return 'That result contains invalid QBTCP assignment metadata.';
+    if (!isPlainObject(extension)) {
+      return { status: 400, error: 'That result contains invalid QBTCP assignment metadata.' };
+    }
     revision = extension.round_revision ?? extension.roundRevision;
   }
   if (revision === undefined) revision = readResultSourceMetadata(match).roundRevision;
-  if (
-    revision !== undefined &&
-    (typeof revision !== 'number' || !Number.isInteger(revision) || revision !== assignment.revision)
-  ) {
-    return 'That result belongs to an older assignment for this room.';
+  if (revision !== undefined && (typeof revision !== 'number' || !Number.isInteger(revision))) {
+    return { status: 400, error: 'That result contains invalid QBTCP assignment metadata.' };
+  }
+  if (typeof revision === 'number' && revision < assignment.revision) {
+    return { status: 410, error: 'A newer assignment has superseded this game.' };
+  }
+  if (typeof revision === 'number' && revision > assignment.revision) {
+    return { status: 409, error: 'That result does not match this room’s current assignment.' };
   }
   return undefined;
+}
+
+/** Compatibility-facing validation message used by focused assignment tests and non-HTTP callers. */
+export function validateResultAgainstAssignment(body: object, assignment: IRoomAssignment): string | undefined {
+  return resultAssignmentValidation(body, assignment)?.error;
 }
 
 function teamIdFromMatchTeam(value: unknown): string | undefined {

@@ -37,7 +37,7 @@ import { TournamentContext } from '../TournamentManager';
 import YfCard from './YfCard';
 import PairingSheetsDialog from './PairingSheetsDialog';
 import { IRoomView } from '../../qbtcp/QbtcpState';
-import { isValidQbtcpPort, presenceFreshMs } from '../../qbtcp/QbtcpProtocol';
+import { isValidQbtcpPort, presenceFreshMs, qbtcpHelpCategoryLabels } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
 import { LinkButton } from '../Utils/GeneralReactUtils';
 
@@ -117,6 +117,7 @@ function RoomsPage() {
                     <TableCell>Pairing code</TableCell>
                     <TableCell>Connection</TableCell>
                     <TableCell>Assignment</TableCell>
+                    <TableCell>Help</TableCell>
                     <TableCell>Result</TableCell>
                     <TableCell align="right">Actions</TableCell>
                   </TableRow>
@@ -224,6 +225,10 @@ function RoomRow(props: IRoomRowProps) {
   const awaitingReview = room.result?.status === 'needs-review' || room.result?.status === 'conflict';
   const assignmentLocked = (!!room.session && !room.session.finalReceived) || awaitingReview;
   const lockReason = awaitingReview ? 'Review this room’s result' : 'Finish the current scoring session';
+  const openHelpRequests = room.helpRequests ?? [];
+  const removalLocked = assignmentLocked || openHelpRequests.length > 0;
+  const removalLockReason =
+    openHelpRequests.length > 0 ? 'Resolve this room’s help request' : `${lockReason} before removing the room`;
   const [assignOpen, setAssignOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [newName, setNewName] = useState(room.name);
@@ -242,11 +247,15 @@ function RoomRow(props: IRoomRowProps) {
             : '—'}
         </TableCell>
         <TableCell>
+          <HelpCell room={room} />
+        </TableCell>
+        <TableCell>
           <ResultCell room={room} />
         </TableCell>
         <TableCell align="right">
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
             <Tooltip describeChild title={assignmentLocked ? `${lockReason} before changing the assignment.` : ''}>
+              {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
               <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                 <Button size="small" disabled={assignmentLocked || rooms.busy} onClick={() => setAssignOpen(true)}>
                   {room.assignment ? 'Change' : 'Assign'}
@@ -256,6 +265,7 @@ function RoomRow(props: IRoomRowProps) {
             {room.assignment && (
               <>
                 <Tooltip describeChild title={assignmentLocked ? `${lockReason} before clearing the assignment.` : ''}>
+                  {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
                   <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                     <Button
                       size="small"
@@ -295,12 +305,13 @@ function RoomRow(props: IRoomRowProps) {
                 <Edit fontSize="small" />
               </IconButton>
             </Tooltip>
-            <Tooltip describeChild title={assignmentLocked ? `${lockReason} before removing the room.` : 'Remove room'}>
-              <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
+            <Tooltip describeChild title={removalLocked ? `${removalLockReason}.` : 'Remove room'}>
+              {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
+              <span tabIndex={removalLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
                 <IconButton
                   size="small"
                   aria-label="Remove room"
-                  disabled={assignmentLocked || rooms.busy}
+                  disabled={removalLocked || rooms.busy}
                   onClick={() =>
                     tournManager.genericModalManager.open(
                       'Remove Room',
@@ -346,6 +357,30 @@ function RoomRow(props: IRoomRowProps) {
         </DialogActions>
       </Dialog>
     </>
+  );
+}
+
+function HelpCell(props: IRoomRowProps) {
+  const { room } = props;
+  const rooms = useContext(TournamentContext).roomsManager;
+  const openHelpRequests = room.helpRequests ?? [];
+  if (openHelpRequests.length === 0) return <span>—</span>;
+  return (
+    <Stack spacing={0.5} sx={{ minWidth: 220 }}>
+      {openHelpRequests.map((request) => (
+        <div key={request.id}>
+          <Chip size="small" color="warning" label={qbtcpHelpCategoryLabels[request.category]} />
+          {request.message && (
+            <Typography variant="body2" sx={{ mt: 0.5, whiteSpace: 'pre-wrap' }}>
+              {request.message}
+            </Typography>
+          )}
+          <Button size="small" disabled={rooms.busy} onClick={() => rooms.resolveHelpRequest(request.id)}>
+            Resolve
+          </Button>
+        </div>
+      ))}
+    </Stack>
   );
 }
 

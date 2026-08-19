@@ -9,7 +9,7 @@
  * No credential crosses this boundary except the pairing code, which a director has to be able to
  * read aloud. Room and session tokens stay in the main process.
  */
-import { IReceivedResult, IQbtcpServerStatus, ReceivedResultStatus } from './QbtcpState';
+import { IReceivedResult, IQbtcpServerStatus, QbtcpRosterPlayerOutcome, ReceivedResultStatus } from './QbtcpState';
 import { ResultComparison } from './ResultFingerprint';
 
 export type QbtcpCommand =
@@ -51,6 +51,10 @@ export type QbtcpCommand =
   | { kind: 'clearAssignment'; roomId: string }
   /** Record what the director decided about a received result. */
   | { kind: 'resolveResult'; resultId: string; status: ReceivedResultStatus }
+  /** Mark a room's open help request resolved from the director UI. */
+  | { kind: 'resolveHelpRequest'; requestId: string }
+  /** Complete the main process's pending HTTP roster request after mutating the tournament. */
+  | { kind: 'completeRosterPlayerRequest'; requestId: string; outcome: QbtcpRosterPlayerOutcome }
   /** Results still awaiting a decision, so a restart can re-offer them. */
   | { kind: 'unresolvedResults' }
   /**
@@ -62,7 +66,17 @@ export type QbtcpCommand =
    *
    * One answer per `Match`, in document order, because a file can hold a whole day of games.
    */
-  | { kind: 'classifyResults'; document: object }
+  | {
+      kind: 'classifyResults';
+      document: object;
+      /**
+       * The unresolved QBTCP result currently being previewed, if this document came from the
+       * network. It is already durable by the time the renderer sees it and must not compare equal
+       * to itself. The server only excludes this id when it names an unresolved result with the same
+       * fingerprint, so this cannot hide an earlier accepted copy or a genuine conflict.
+       */
+      reviewingResultId?: string;
+    }
   /** Record a result that came in as a file, once the director has committed the import. */
   | { kind: 'recordFileResult'; document: object }
   /** Whether unresolved scored work would be destroyed by switching tournaments. */

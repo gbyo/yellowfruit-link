@@ -9,6 +9,7 @@ import { IIndeterminateQbj, IQbjObject, IQbjWholeFile, IRefTargetDict } from './
 import AnswerType from './DataModel/AnswerType';
 import StandardSchedule from './DataModel/StandardSchedule';
 import { Team } from './DataModel/Team';
+import { Player } from './DataModel/Player';
 import Registration, { IQbjRegistration } from './DataModel/Registration';
 import { TempTeamManager } from './Modal Managers/TempTeamManager';
 import { GenericModalManager } from './Modal Managers/GenericModalManager';
@@ -45,8 +46,8 @@ import RoomsManager from './Modal Managers/RoomsManager';
 import ScheduledGameManager from './Modal Managers/ScheduledGameManager';
 import { ScheduledGame } from './DataModel/ScheduledGame';
 import { PairingGenerationMode, scheduledGameLockReason } from './DataModel/PairingGeneration';
-import { IReceivedResult } from '../qbtcp/QbtcpState';
-import { QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
+import { IReceivedResult, IQbtcpRosterPlayerRequest, QbtcpRosterPlayerOutcome } from '../qbtcp/QbtcpState';
+import { QbtcpCommand, QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
 import { ResultComparison, readResultIdentities, readResultIdentity } from '../qbtcp/ResultFingerprint';
 
 /** Holds the tournament the application is currently editing */
@@ -218,6 +219,9 @@ export class TournamentManager {
     });
     window.electron.ipcRenderer.on(IpcMainToRend.QbtcpStateChanged, () => {
       this.roomsManager.refresh();
+    });
+    window.electron.ipcRenderer.on(IpcMainToRend.QbtcpRosterPlayerRequested, (request) => {
+      this.handleQbtcpRosterPlayerRequest(request as IQbtcpRosterPlayerRequest).catch(() => undefined);
     });
     window.electron.ipcRenderer.on(IpcMainToRend.MakeToast, (message) => {
       this.makeToast(message as string);
@@ -607,7 +611,11 @@ export class TournamentManager {
    * @param fileAry The files we're trying to parse
    * @param round Which round the matches should go into. If not passed, use the files to determine the correct rounds.
    */
-  private async importMatchesFromQbj(fileAry: IMatchImportFileRequest[], round?: Round) {
+  private async importMatchesFromQbj(
+    fileAry: IMatchImportFileRequest[],
+    round?: Round,
+    reviewingQbtcpResultId?: string,
+  ) {
     if (fileAry.length === 0) return;
 
     const phase = round ? this.tournament.findPhaseByRound(round) : undefined;
@@ -629,7 +637,7 @@ export class TournamentManager {
       // routes compute the same value for the same game by construction. One answer per game in the
       // file: a file whose first game is already on record says nothing about its other nine.
       // eslint-disable-next-line no-await-in-loop
-      const comparisons = await classifyIncomingResults(fileContents);
+      const comparisons = await classifyIncomingResults(fileContents, reviewingQbtcpResultId);
 
       const isBareCamelCaseMatch =
         !Array.isArray((objFromFile as { objects?: unknown }).objects) &&
@@ -1784,6 +1792,46 @@ export class TournamentManager {
     this.queueQbtcpResult(result);
   }
 
+  /** Apply QBSheet's authenticated live roster addition to the tournament before acknowledging it. */
+  async handleQbtcpRosterPlayerRequest(request: IQbtcpRosterPlayerRequest): Promise<void> {
+    let outcome: QbtcpRosterPlayerOutcome;
+    try {
+      const team = this.tournament.findTeamById(request.teamId);
+      const playerName = request.playerName.trim();
+      if (!team || team.name !== request.teamName) {
+        outcome = { ok: false, error: 'That team is no longer in this tournament.' };
+      } else if (playerName === '' || playerName.length > Player.nameMaxLength) {
+        outcome = { ok: false, error: `A player name must be between 1 and ${Player.nameMaxLength} characters.` };
+      } else if (team.players.some((player) => player.name.toLocaleUpperCase() === playerName.toLocaleUpperCase())) {
+        // A network retry of a request already applied is successful and creates no duplicate.
+        outcome = { ok: true };
+      } else if (team.players.length >= Team.maxPlayers) {
+        outcome = { ok: false, error: `A team cannot have more than ${Team.maxPlayers} players.` };
+      } else {
+        team.players.push(new Player(playerName));
+        team.validateAll();
+        this.onDataChanged();
+        // Queue an immediate recovery copy before the HTTP request is acknowledged. The normal .yft
+        // remains dirty so the director is still prompted to save it.
+        this.saveBackup();
+        this.makeToast(`${playerName} was added to ${team.name} from QBSheet.`, 'info');
+        outcome = { ok: true };
+      }
+    } catch {
+      outcome = { ok: false, error: 'YellowFruit could not apply that roster update.' };
+    }
+
+    try {
+      await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
+        kind: 'completeRosterPlayerRequest',
+        requestId: request.requestId,
+        outcome,
+      } as QbtcpCommand);
+    } catch {
+      // The server owns the timeout and will give QBSheet a retryable failure if this reply is lost.
+    }
+  }
+
   /** Reopen a durable result from the Rooms page after the original review was dismissed or missed. */
   async reviewQbtcpResult(resultId: string): Promise<void> {
     try {
@@ -1841,7 +1889,11 @@ export class TournamentManager {
     const label = `${next.roundNumber ? `Round ${next.roundNumber}` : 'Room result'} (QBSheet)`;
     const round = next.roundNumber !== undefined ? this.tournament.getRoundObjByNumber(next.roundNumber) : undefined;
     try {
-      await this.importMatchesFromQbj([{ filePath: label, fileContents: JSON.stringify(next.document) }], round);
+      await this.importMatchesFromQbj(
+        [{ filePath: label, fileContents: JSON.stringify(next.document) }],
+        round,
+        next.id,
+      );
     } catch (error) {
       this.pendingQbtcpResultIds = this.pendingQbtcpResultIds.filter((id) => id !== next.id);
       this.makeToast(`Rooms: could not review result: ${(error as Error).message}`, 'error');
@@ -2093,13 +2145,17 @@ function plainParse(fileContents: string): object | null {
  * failed. An unavailable adapter must never block a manual import: file workflows have to keep
  * working whether or not QBTCP is in use.
  */
-async function classifyIncomingResults(fileContents: string): Promise<Map<string, ResultComparison> | undefined> {
+async function classifyIncomingResults(
+  fileContents: string,
+  reviewingResultId?: string,
+): Promise<Map<string, ResultComparison> | undefined> {
   const document = plainParse(fileContents);
   if (!document) return undefined;
   try {
     const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
       kind: 'classifyResults',
       document,
+      ...(reviewingResultId ? { reviewingResultId } : {}),
     })) as QbtcpCommandResult;
     if (!reply?.ok || !('comparisons' in reply)) return undefined;
     const identities = readResultIdentities(document);

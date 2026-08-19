@@ -12,7 +12,12 @@ import { app, dialog, ipcMain, BrowserWindow } from 'electron';
 import fs from 'fs';
 import { IpcBidirectional, IpcMainToRend } from '../../IPCChannels';
 import { QbtcpCommand, QbtcpCommandResult } from '../../qbtcp/QbtcpCommands';
-import { IQbtcpServerStatus, IRoomView } from '../../qbtcp/QbtcpState';
+import {
+  IQbtcpRosterPlayerRequest,
+  IQbtcpServerStatus,
+  IRoomView,
+  QbtcpRosterPlayerOutcome,
+} from '../../qbtcp/QbtcpState';
 import { defaultQbtcpPort, isValidQbtcpPort, presenceFreshMs } from '../../qbtcp/QbtcpProtocol';
 import { defaultScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import QbtcpServer, { lanAddresses } from './QbtcpServer';
@@ -34,10 +39,38 @@ export function getPairingSheetHtml(): string | undefined {
 /** The window to notify. Held rather than looked up so a notification cannot pick the wrong window. */
 let targetWindow: BrowserWindow | null = null;
 
+const pendingRosterRequests = new Map<
+  string,
+  { resolve: (outcome: QbtcpRosterPlayerOutcome) => void; timeout: ReturnType<typeof setTimeout> }
+>();
+
 function notify(channel: IpcMainToRend, payload?: unknown): void {
   // A destroyed window is the ordinary case during shutdown, not an error.
   if (!targetWindow || targetWindow.isDestroyed()) return;
   targetWindow.webContents.send(channel, payload);
+}
+
+function requestRosterPlayer(request: IQbtcpRosterPlayerRequest): Promise<QbtcpRosterPlayerOutcome> {
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return Promise.resolve({ ok: false, status: 503, error: 'YellowFruit is not ready to update the roster.' });
+  }
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      pendingRosterRequests.delete(request.requestId);
+      resolve({ ok: false, status: 503, error: 'YellowFruit did not finish the roster update in time.' });
+    }, 6500);
+    pendingRosterRequests.set(request.requestId, { resolve, timeout });
+    notify(IpcMainToRend.QbtcpRosterPlayerRequested, request);
+  });
+}
+
+function completeRosterPlayerRequest(requestId: string, outcome: QbtcpRosterPlayerOutcome): boolean {
+  const pending = pendingRosterRequests.get(requestId);
+  if (!pending) return false;
+  pendingRosterRequests.delete(requestId);
+  clearTimeout(pending.timeout);
+  pending.resolve(outcome);
+  return true;
 }
 
 function ensureServer(): QbtcpServer {
@@ -45,6 +78,7 @@ function ensureServer(): QbtcpServer {
     server = new QbtcpServer(new QbtcpStore(app.getPath('userData')), {
       onResultReceived: (result) => notify(IpcMainToRend.QbtcpResultReceived, result),
       onStateChanged: () => notify(IpcMainToRend.QbtcpStateChanged),
+      onRosterPlayerRequested: requestRosterPlayer,
     });
   }
   return server;
@@ -122,6 +156,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
             },
           }
         : {}),
+      helpRequests: state.helpRequests.filter((request) => request.roomId === room.id && request.status === 'open'),
     };
   });
 
@@ -207,10 +242,20 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
     case 'resolveResult':
       await instance.resolveResult(command.resultId, command.status);
       return { ok: true, status: buildStatus(instance) };
+    case 'resolveHelpRequest':
+      await instance.resolveHelpRequest(command.requestId);
+      return { ok: true, status: buildStatus(instance) };
+    case 'completeRosterPlayerRequest':
+      return completeRosterPlayerRequest(command.requestId, command.outcome)
+        ? { ok: true }
+        : { ok: false, error: 'That roster update is no longer waiting for a response.' };
     case 'unresolvedResults':
       return { ok: true, results: instance.unresolvedResults() };
     case 'classifyResults':
-      return { ok: true, comparisons: instance.classifyResults(command.document) };
+      return {
+        ok: true,
+        comparisons: instance.classifyResults(command.document, command.reviewingResultId),
+      };
     case 'recordFileResult':
       await instance.recordFileResult(command.document);
       return { ok: true };
@@ -302,6 +347,12 @@ export function registerQbtcpIpc(window: BrowserWindow | null): void {
 /** Called when the window changes, so notifications keep reaching a live renderer. */
 export function setQbtcpWindow(window: BrowserWindow | null): void {
   targetWindow = window;
+  if (window) return;
+  for (const [requestId, pending] of pendingRosterRequests) {
+    clearTimeout(pending.timeout);
+    pending.resolve({ ok: false, status: 503, error: 'YellowFruit closed before applying the roster update.' });
+    pendingRosterRequests.delete(requestId);
+  }
 }
 
 /** Stop the server on shutdown so the port is released. */

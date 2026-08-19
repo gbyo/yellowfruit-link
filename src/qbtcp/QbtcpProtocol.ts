@@ -34,11 +34,39 @@ export const operatorNameHeader = 'x-yf-operator-name';
  * What this server actually supports.
  *
  * Discovery MUST advertise only capabilities that work, because a client is forbidden from inferring
- * support from the absence of an error. `help` and remote roster editing are absent because they are
- * not implemented here - QBSheet requires only `pairing`, `assignment` and `result` for connected
- * scoring, and treats the rest as enhancements.
+ * support from the absence of an error. `roster` names QBSheet's current authenticated player-add
+ * extension; player data remains QBJ, while this capability carries the live request to update the
+ * tournament roster before the final QBJ comes back.
  */
-export const advertisedCapabilities = ['pairing', 'assignment', 'progress', 'result', 'recovery', 'presence'] as const;
+export const advertisedCapabilities = [
+  'pairing',
+  'assignment',
+  'progress',
+  'result',
+  'recovery',
+  'help',
+  'presence',
+  'roster',
+] as const;
+
+/** The help categories the current QBSheet build can send and render. */
+export const qbtcpHelpCategoryLabels = {
+  'wrong-matchup': 'Wrong matchup',
+  'team-missing': "Team hasn't arrived",
+  protest: 'Protest / disputed ruling',
+  'question-packet': 'Question / packet issue',
+  'roster-change': 'Roster change',
+  'equipment-technical': 'Equipment / technical issue',
+  'rules-question': 'Rules question',
+  'scoring-problem': 'Scoring problem',
+  'device-network': 'Device/network problem',
+  'wrong-room': 'Wrong room',
+  other: 'Other',
+} as const;
+
+export type QbtcpHelpCategory = keyof typeof qbtcpHelpCategoryLabels;
+
+export const qbtcpHelpCategories = Object.keys(qbtcpHelpCategoryLabels) as QbtcpHelpCategory[];
 
 /** Assignment lifecycle state, as reported by `GET /qbtcp/v1/assignment/status`. */
 export type QbtcpAssignmentState = 'assigned' | 'none' | 'blocked' | 'held';
