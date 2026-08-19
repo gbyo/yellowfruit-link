@@ -1383,12 +1383,27 @@ export class TournamentManager {
   }
 
   tryDeleteTeam(reg: Registration, team: Team) {
+    // Asked before the confirmation is even offered, so a director is not walked up to a Yes that
+    // cannot be honoured.
+    const blockReason = this.tournament.teamScheduledGameDeletionBlockReason(team);
+    if (blockReason) {
+      this.makeToast(`${team.name} can't be deleted: ${blockReason}.`, 'warning');
+      return;
+    }
     this.genericModalManager.open('Delete Team', `Are you sure you want to delete ${team.name}?`, 'N&o', '&Yes', () =>
       this.deleteTeam(reg, team),
     );
   }
 
   deleteTeam(reg: Registration, team: Team) {
+    // Asked again immediately before the deletion. A room can be given one of this team's pairings
+    // while the confirmation is on screen, and the check above would then be describing a tournament
+    // that no longer exists.
+    const blockReason = this.tournament.teamScheduledGameDeletionBlockReason(team);
+    if (blockReason) {
+      this.makeToast(`${team.name} can't be deleted: ${blockReason}.`, 'warning');
+      return;
+    }
     this.tournament.deleteTeam(reg, team);
     this.onDataChanged();
   }
@@ -1455,13 +1470,22 @@ export class TournamentManager {
     this.onDataChanged();
   }
 
-  addTeamtoPlayoffPool(team: Team, pool: Pool, nextPhase: Phase) {
+  /**
+   * Put one team into a playoff pool.
+   *
+   * @param deferPairings True when the caller is in the middle of a larger rebracketing and will
+   * refresh the phase's pairings itself once every team has landed. Generating per team would build
+   * a schedule for half a pool, throw it away, and build another - repeatedly, against pools that are
+   * not yet the pools anyone will play in.
+   */
+  addTeamtoPlayoffPool(team: Team, pool: Pool, nextPhase: Phase, deferPairings: boolean = false) {
     pool.addTeam(team);
     this.tournament.carryOverMatches(
       nextPhase,
       pool.poolTeams.map((pt) => pt.team),
     );
     this.tournament.getPrevFullPhase(nextPhase)?.markTeamDidNotAdvance(team, false);
+    if (!deferPairings) this.refreshPairingsAfterRebracketing(nextPhase);
     this.compileStats();
     this.onDataChanged();
   }
@@ -1477,8 +1501,28 @@ export class TournamentManager {
       nextPhase,
       poolStats.poolTeams.map((ptStats) => ptStats.team),
     );
+    // After the whole pool has moved, and after its games have been carried over - the schedule a
+    // carryover pool needs depends on both.
+    this.refreshPairingsAfterRebracketing(nextPhase);
     this.compileStats();
     this.onDataChanged();
+  }
+
+  /**
+   * Write the playoff pairings once a rebracketing operation has finished.
+   *
+   * The transaction boundary, not each `pool.addTeam`. A template's prelim pairings can be generated
+   * as teams are seeded because the prelim pools are known from the start; playoff pools are empty
+   * until the teams that earned their way into them are put there, so their schedules cannot exist
+   * before this point.
+   *
+   * `ReplaceGenerated` throughout, so this is only ever allowed to rewrite what the generator itself
+   * produced. A hand-built playoff schedule, a pairing a room is scoring, a result awaiting review and
+   * a game already played each keep their pool exactly as it is; the generator reports why and this
+   * path leaves the existing schedule in place, the same as every other automatic refresh.
+   */
+  private refreshPairingsAfterRebracketing(phase: Phase) {
+    this.tournament.refreshTemplatePairingsForPhase(phase);
   }
 
   /**
@@ -1494,10 +1538,13 @@ export class TournamentManager {
     this.tournament.clearCarryoverMatches(team, nextPhase);
     if (curPool) curPool.removeTeam(team);
     if (newPool) {
-      this.addTeamtoPlayoffPool(team, newPool, nextPhase);
+      // Deferred: this override changes two pools at once when a team moves between them, and both
+      // have to be settled before either one's schedule means anything.
+      this.addTeamtoPlayoffPool(team, newPool, nextPhase, true);
     } else {
       this.tournament.getPrevFullPhase(nextPhase)?.markTeamDidNotAdvance(team, true);
     }
+    this.refreshPairingsAfterRebracketing(nextPhase);
 
     this.compileStats();
     this.onDataChanged();
