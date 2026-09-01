@@ -19,7 +19,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      npm-cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Check out YellowFruit
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Derive trusted YellowFruit npm cache key
+        id: cache-key
+        run: echo "key=yellowfruit-npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore or save YellowFruit npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Populate YellowFruit npm cache
+        run: npm install --ignore-scripts --no-audit --no-fund
+
   browser-contract:
+    needs: prepare-cache
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -55,10 +83,12 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 20
-          # PR caches are scoped to the pull request; manual ref selection is intentionally
-          # uncached so arbitrary companion code cannot poison a shared default-branch cache.
-          cache: ${{ github.event_name == 'pull_request' && 'npm' || '' }}
-          cache-dependency-path: package-lock.json
+
+      - name: Restore trusted YellowFruit npm cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.npm
+          key: ${{ needs.prepare-cache.outputs.npm-cache-key }}
 
       - name: Install YellowFruit dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
