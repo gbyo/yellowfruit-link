@@ -44,6 +44,7 @@ import { LinkButton } from '../Utils/GeneralReactUtils';
 import { Round } from '../DataModel/Round';
 import { ScheduledGame } from '../DataModel/ScheduledGame';
 import { phaseCanGeneratePairings } from '../DataModel/PairingGeneration';
+import RoundProcedureDialog from './RoundProcedureDialog';
 
 const cardTitle = 'Schedule Detail';
 const unlockCustSchedTooltip =
@@ -507,6 +508,9 @@ function RoundPairings(props: IRoundPairingsProps) {
   const { phase, round } = props;
   const tournManager = useContext(TournamentContext);
   const { scheduledGames } = round;
+  const [procedureOpen, setProcedureOpen] = useState(false);
+  const procedureSummary = round.roomProcedure ? 'Custom room procedure' : 'Tournament defaults';
+  const handoffSummary = round.handoffInstruction ? ' · Custom handoff' : '';
 
   return (
     <Box>
@@ -517,6 +521,18 @@ function RoundPairings(props: IRoundPairingsProps) {
         <Typography variant="body2" color="text.secondary">
           {pairingSummary(scheduledGames.length, round.countCompletedScheduledGames())}
         </Typography>
+        <Tooltip title={`${procedureSummary}${handoffSummary}`}>
+          <span>
+            <IconButton
+              size="small"
+              aria-label={`Edit ${round.displayName()} room procedure`}
+              disabled={tournManager.tournament.hasMatchData}
+              onClick={() => setProcedureOpen(true)}
+            >
+              <Tune fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
         <Tooltip title="Add a pairing to this round">
           <IconButton size="small" onClick={() => tournManager.openScheduledGameModal(phase, round)}>
             <Add fontSize="small" />
@@ -530,6 +546,7 @@ function RoundPairings(props: IRoundPairingsProps) {
           ))}
         </List>
       )}
+      {procedureOpen && <RoundProcedureDialog round={round} open onClose={() => setProcedureOpen(false)} />}
     </Box>
   );
 }

@@ -9,7 +9,13 @@
  * No credential crosses this boundary except the pairing code, which a director has to be able to
  * read aloud. Room and session tokens stay in the main process.
  */
-import { IReceivedResult, IQbtcpServerStatus, QbtcpRosterPlayerOutcome, ReceivedResultStatus } from './QbtcpState';
+import {
+  IReceivedResult,
+  IQbtcpServerStatus,
+  IResultReviewRequest,
+  QbtcpRosterPlayerOutcome,
+  ReceivedResultStatus,
+} from './QbtcpState';
 import { ResultComparison } from './ResultFingerprint';
 
 export type QbtcpCommand =
@@ -47,10 +53,16 @@ export type QbtcpCommand =
        * the stored record moved on twice, and a correctly scored result would be refused as stale.
        */
       roundRevision: number;
+      /** The independent revision of this room's assignment document. */
+      assignmentRevision?: number;
     }
   | { kind: 'clearAssignment'; roomId: string }
-  /** Record what the director decided about a received result. */
+  /** Explicit director action that releases a session without discarding its progress. */
+  | { kind: 'abandonSession'; sessionId: string; reason?: string }
+  /** Backward-compatible status setter used after the shared importer commits a result. */
   | { kind: 'resolveResult'; resultId: string; status: ReceivedResultStatus }
+  /** Explicitly reconcile a received result, retaining both sides of any correction. */
+  | ({ kind: 'reviewResult'; resultId: string } & IResultReviewRequest)
   /** Mark a room's open help request resolved from the director UI. */
   | { kind: 'resolveHelpRequest'; requestId: string }
   /** Complete the main process's pending HTTP roster request after mutating the tournament. */
@@ -98,6 +110,7 @@ export type QbtcpCommandResult =
   | { ok: true; hasActiveWork: boolean }
   | { ok: true; comparisons: ResultComparison[] }
   | { ok: true; exported: boolean }
+  | { ok: true; abandoned: boolean; progressSequence?: number; hadProgress?: boolean; warning?: string }
   | { ok: true }
   /** `error` is always safe to show a director, and never contains a credential. */
   | { ok: false; error: string };

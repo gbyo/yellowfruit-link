@@ -60,6 +60,8 @@ export interface IAssignmentBuildRequest {
   roomId: string;
   /** Which issue of this round's pairings this is. */
   roundRevision: number;
+  /** Which issue of this room assignment this is, separate from the round revision. */
+  assignmentRevision?: number;
 }
 
 /** A QBJ object under construction. Deliberately loose: this file assembles a document by hand. */
@@ -142,7 +144,20 @@ function stateAwardsBonusExplicitly(scoringRules: QbjNode): void {
  * tournament's actual rules rather than a second description of them that could disagree.
  */
 export function buildAssignmentDocument(request: IAssignmentBuildRequest): object {
-  const { tournament, phase, round, leftTeam, rightTeam, matchId, roomName, roomId, roundRevision } = request;
+  const {
+    tournament,
+    phase,
+    round,
+    leftTeam,
+    rightTeam,
+    matchId,
+    roomName,
+    roomId,
+    roundRevision,
+    assignmentRevision,
+  } = request;
+  const procedure = tournament.roomProcedureForRound(round);
+  const handoffInstruction = tournament.handoffInstructionForRound(round);
 
   // qbjOnly, top-level (so it carries `type`), and referenced (so it carries `id` for the $ref).
   const scoringRules = tournament.scoringRules.toFileObject(true, true, true) as unknown as QbjNode;
@@ -160,7 +175,12 @@ export function buildAssignmentDocument(request: IAssignmentBuildRequest): objec
     [qbtcpExtensionKey]: {
       version: qbtcpExtensionVersion,
       round_revision: roundRevision,
+      ...(assignmentRevision !== undefined ? { assignment_revision: assignmentRevision } : {}),
       room_id: roomId,
+      // These are structural QBTCP keys, not QBJ fields. Keep the procedure's field names intact
+      // while the generic QBJ case conversion runs over the document.
+      procedure,
+      ...(handoffInstruction ? { handoff_instruction: handoffInstruction } : {}),
       // The one scoring semantic QBJ cannot express. QBSheet refuses to start scoring without it
       // rather than assuming either value, so it is always sent.
       scorekeeper: { timed: tournament.scoringRules.timed },

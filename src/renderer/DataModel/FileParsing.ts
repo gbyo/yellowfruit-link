@@ -19,6 +19,7 @@ import { IQbjRank } from './Rank';
 import { IQbjRanking, OverallRanking, Ranking } from './Ranking';
 import Registration, { IQbjRegistration, IYftFileRegistration } from './Registration';
 import { IQbjRound, IYftFileRound, Round, sortRounds } from './Round';
+import { defaultRoomProcedure, normalizeHandoffInstruction, normalizeRoomProcedure } from './RoomProcedure';
 import { IYftFileScheduledGame, ScheduledGame } from './ScheduledGame';
 import { IQbjScoringRules, IYftFileScoringRules, ScoringRules } from './ScoringRules';
 import { IQbjTeam, IYftFileTeam, Team } from './Team';
@@ -169,6 +170,10 @@ export default class FileParser {
       // Absent in files written before this field existed. Left empty here rather than generated, so
       // that parsing stays free of side effects; the next save assigns one.
       this.tourn.tournamentId = yfExtraData.tournamentId || '';
+      this.tourn.roomProcedure = yfExtraData.roomProcedure
+        ? normalizeRoomProcedure(yfExtraData.roomProcedure)
+        : defaultRoomProcedure();
+      this.tourn.handoffInstruction = normalizeHandoffInstruction(yfExtraData.handoffInstruction);
     } else {
       this.tourn.inferCarryoverStatus();
     }
@@ -708,12 +713,25 @@ export default class FileParser {
     // returning - an early return used to leave every such round empty.
     const isNonNumeric = !Number.isFinite(roundNumber);
     const yftRound = new Round(isNonNumeric ? fallbackRoundNo : roundNumber);
+    if (
+      typeof yfExtraData?.revision === 'number' &&
+      Number.isInteger(yfExtraData.revision) &&
+      yfExtraData.revision >= 1
+    ) {
+      yftRound.revision = yfExtraData.revision;
+    }
     if (isNonNumeric && typeof qbjRound.name === 'string') yftRound.name = qbjRound.name;
 
     const packetFromFile = this.parseRoundPacket(qbjRound);
     if (packetFromFile) yftRound.packet = packetFromFile;
 
     if (typeof yfExtraData?.nonNumericName === 'string') yftRound.name = yfExtraData.nonNumericName;
+    if (yfExtraData?.roomProcedure !== undefined) {
+      yftRound.roomProcedure = normalizeRoomProcedure(yfExtraData.roomProcedure);
+    }
+    if (yfExtraData?.handoffInstruction !== undefined) {
+      yftRound.handoffInstruction = normalizeHandoffInstruction(yfExtraData.handoffInstruction);
+    }
     yftRound.matches = this.parseRoundMatches(qbjRound);
     yftRound.scheduledGames = this.parseScheduledGames(yfExtraData?.scheduledGames);
     return yftRound;

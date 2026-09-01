@@ -36,7 +36,7 @@ import { snakeCaseToCamelCase, camelCaseToSnakeCase, earlyYftFileConversions } f
 import { CommonRuleSets } from './DataModel/ScoringRules';
 import { qbjFileValidVersion } from './DataModel/QbjUtils';
 import PoolAssignmentModalManager from './Modal Managers/PoolAssignmentModalManager';
-import MatchImportResult from './DataModel/MatchImportResult';
+import MatchImportResult, { ImportResultStatus } from './DataModel/MatchImportResult';
 import MatchImportResultsManager from './Modal Managers/MatchImportResultsManager';
 import { parseOldYfFile, isOldYftFile } from './DataModel/OldYfParsing';
 import parseTeamsFromSqbsFile from './DataModel/SqbsParsing';
@@ -46,7 +46,13 @@ import RoomsManager from './Modal Managers/RoomsManager';
 import ScheduledGameManager from './Modal Managers/ScheduledGameManager';
 import { ScheduledGame } from './DataModel/ScheduledGame';
 import { PairingGenerationMode, scheduledGameLockReason } from './DataModel/PairingGeneration';
-import { IReceivedResult, IQbtcpRosterPlayerRequest, QbtcpRosterPlayerOutcome } from '../qbtcp/QbtcpState';
+import {
+  IReceivedResult,
+  IResultDiscrepancy,
+  IQbtcpRosterPlayerRequest,
+  QbtcpRosterPlayerOutcome,
+  ResultReviewDecision,
+} from '../qbtcp/QbtcpState';
 import { QbtcpCommand, QbtcpCommandResult } from '../qbtcp/QbtcpCommands';
 import { ResultComparison, readResultIdentities, readResultIdentity } from '../qbtcp/ResultFingerprint';
 
@@ -615,6 +621,7 @@ export class TournamentManager {
     fileAry: IMatchImportFileRequest[],
     round?: Round,
     reviewingQbtcpResultId?: string,
+    qbtcpWarnings: IResultDiscrepancy[] = [],
   ) {
     if (fileAry.length === 0) return;
 
@@ -627,6 +634,7 @@ export class TournamentManager {
       if (!objFromFile) {
         const badFile = new MatchImportResult(filePath);
         badFile.markFatal('This file does not contain valid JSON.');
+        annotateQbtcpReview([badFile], reviewingQbtcpResultId, qbtcpWarnings);
         results.push(badFile);
         // eslint-disable-next-line no-continue
         continue;
@@ -673,11 +681,17 @@ export class TournamentManager {
       }
 
       annotateAlreadyRecorded(fileResults, comparisons);
+      annotateQbtcpReview(fileResults, reviewingQbtcpResultId, qbtcpWarnings);
       for (const fileResult of fileResults) {
         // Remembered per game, so a later automatic retry of any one of them is recognised. Recording
         // only the file's first game would leave the rest able to arrive a second time. A game that
         // could not be parsed into a match is not remembered: nothing was added for it to duplicate.
-        if (fileResult.match && fileResult.sourceMatch && fileResult.comparison?.kind === 'new') {
+        if (
+          !reviewingQbtcpResultId &&
+          fileResult.match &&
+          fileResult.sourceMatch &&
+          fileResult.comparison?.kind === 'new'
+        ) {
           this.pendingFileResultsToRecord.push(fileResult.sourceMatch);
         }
       }
@@ -687,6 +701,12 @@ export class TournamentManager {
     MatchImportResult.validateImportSetForTeamDups(results);
     this.tournament.setMatchIdCounter();
     this.openMatchImportModal(results, round);
+    if (reviewingQbtcpResultId && canAutoAcceptQbtcpResults(results)) {
+      // Use the same modal commit/bookkeeping path as a human Import click. The modal is opened so
+      // the parser and commit boundary remain identical; it is closed in the same turn before a
+      // clean result can flash a director-only review surface.
+      this.closeMatchImportModal(true);
+    }
   }
 
   /**
@@ -1703,9 +1723,15 @@ export class TournamentManager {
   }
 
   closeMatchImportModal(shouldSave: boolean) {
+    // Snapshot decisions before closeModal resets the review rows. A QBTCP receipt is already
+    // durable in the main process, so cancelling intentionally leaves it in the Rooms review queue;
+    // saving sends the director's explicit Replace/Keep/Dismiss decision below.
+    const qbtcpDecisions = shouldSave
+      ? this.matchImportResultsManager.getQbtcpReviewDecisions()
+      : new Map<string, { decision: ResultReviewDecision }>();
     this.matchImportResultsManager.closeModal(shouldSave);
     this.onDataChanged(!shouldSave);
-    this.finishRoomsBookkeeping(shouldSave);
+    this.finishRoomsBookkeeping(shouldSave, qbtcpDecisions);
   }
 
   /**
@@ -1722,7 +1748,10 @@ export class TournamentManager {
    * "accepted". Marking the file dirty is not enough on its own, because dirty only means the next
    * save will include it.
    */
-  private async finishRoomsBookkeeping(shouldSave: boolean) {
+  private async finishRoomsBookkeeping(
+    shouldSave: boolean,
+    qbtcpDecisions: Map<string, { decision: ResultReviewDecision; existingResultId?: string; reason?: string }>,
+  ) {
     this.roomsBookkeepingInProgress = true;
     const documents = this.pendingFileResultsToRecord;
     const resultIds = this.pendingQbtcpResultIds;
@@ -1751,12 +1780,15 @@ export class TournamentManager {
       }
 
       for (const resultId of resultIds) {
+        const decision = qbtcpDecisions.get(resultId) ?? { decision: 'dismiss' as const };
         try {
           // eslint-disable-next-line no-await-in-loop
           const reply = (await window.electron.ipcRenderer.invoke(IpcBidirectional.QbtcpCommand, {
-            kind: 'resolveResult',
+            kind: 'reviewResult',
             resultId,
-            status: 'accepted',
+            decision: decision.decision,
+            ...(decision.existingResultId ? { existingResultId: decision.existingResultId } : {}),
+            ...(decision.reason ? { reason: decision.reason } : {}),
           })) as QbtcpCommandResult | undefined;
           if (!reply?.ok) {
             this.makeToast(
@@ -1798,24 +1830,45 @@ export class TournamentManager {
     try {
       const team = this.tournament.findTeamById(request.teamId);
       const playerName = request.playerName.trim();
-      if (!team || team.name !== request.teamName) {
+      if (!team) {
         outcome = { ok: false, error: 'That team is no longer in this tournament.' };
       } else if (playerName === '' || playerName.length > Player.nameMaxLength) {
         outcome = { ok: false, error: `A player name must be between 1 and ${Player.nameMaxLength} characters.` };
       } else if (team.players.some((player) => player.name.toLocaleUpperCase() === playerName.toLocaleUpperCase())) {
-        // A network retry of a request already applied is successful and creates no duplicate.
-        outcome = { ok: true };
+        // A network retry of a request already applied is successful and creates no duplicate. Return
+        // the existing stable YF identity so a recovering QBSheet can key future results to it.
+        const existingPlayer = team.players.find(
+          (player) => player.name.toLocaleUpperCase() === playerName.toLocaleUpperCase(),
+        );
+        outcome = {
+          ok: true,
+          playerId: existingPlayer?.id,
+          playerName: existingPlayer?.name ?? playerName,
+          teamId: team.id,
+          teamName: team.name,
+          created: false,
+          ...(team.name !== request.teamName ? { warning: 'team-name-mismatch' } : {}),
+        };
       } else if (team.players.length >= Team.maxPlayers) {
         outcome = { ok: false, error: `A team cannot have more than ${Team.maxPlayers} players.` };
       } else {
-        team.players.push(new Player(playerName));
+        const addedPlayer = new Player(playerName);
+        team.players.push(addedPlayer);
         team.validateAll();
         this.onDataChanged();
         // Queue an immediate recovery copy before the HTTP request is acknowledged. The normal .yft
         // remains dirty so the director is still prompted to save it.
         this.saveBackup();
         this.makeToast(`${playerName} was added to ${team.name} from QBSheet.`, 'info');
-        outcome = { ok: true };
+        outcome = {
+          ok: true,
+          playerId: addedPlayer.id,
+          playerName: addedPlayer.name,
+          teamId: team.id,
+          teamName: team.name,
+          created: true,
+          ...(team.name !== request.teamName ? { warning: 'team-name-mismatch' } : {}),
+        };
       }
     } catch {
       outcome = { ok: false, error: 'YellowFruit could not apply that roster update.' };
@@ -1893,6 +1946,7 @@ export class TournamentManager {
         [{ filePath: label, fileContents: JSON.stringify(next.document) }],
         round,
         next.id,
+        next.warnings ?? [],
       );
     } catch (error) {
       this.pendingQbtcpResultIds = this.pendingQbtcpResultIds.filter((id) => id !== next.id);
@@ -2197,6 +2251,58 @@ function annotateAlreadyRecorded(
       );
     }
   }
+}
+
+/** Attach an explicit, conservative review action to a result already retained by QBTCP. */
+function annotateQbtcpReview(
+  fileResults: MatchImportResult[],
+  resultId?: string,
+  warnings: IResultDiscrepancy[] = [],
+): void {
+  if (!resultId) return;
+  for (const result of fileResults) {
+    result.qbtcpResultId = resultId;
+    for (const warning of warnings) {
+      if (typeof warning.message === 'string' && warning.message.trim() !== '') {
+        result.markWarning(`Tournament control: ${warning.message.slice(0, 500)}`);
+      }
+    }
+    if (result.comparison?.kind === 'conflict') {
+      result.qbtcpReviewAction = 'keep-existing';
+      result.qbtcpExistingResultId = result.comparison.existingId;
+      result.proceedWithImport = false;
+    } else if (result.comparison?.kind === 'duplicate' || result.status === ImportResultStatus.FatalErr) {
+      result.qbtcpReviewAction = 'dismiss';
+      result.proceedWithImport = false;
+    } else if (result.status === ImportResultStatus.Success || result.status === ImportResultStatus.Warning) {
+      // Clean and warning-level results are safe to import by default. The director can still
+      // choose Dismiss in the modal, and warning-level content remains visible for inspection.
+      result.qbtcpReviewAction = 'accept';
+      result.proceedWithImport = true;
+    } else {
+      // Parseable-but-invalid results stay retained and reviewable, but cannot become a Match until
+      // a director deliberately chooses Replace/Import after resolving the displayed issue.
+      result.qbtcpReviewAction = 'dismiss';
+      result.proceedWithImport = false;
+    }
+  }
+}
+
+/** Clean QBTCP receipts use the ordinary importer but do not need a director to click Import. */
+export function canAutoAcceptQbtcpResults(results: MatchImportResult[]): boolean {
+  return (
+    results.length > 0 &&
+    results.every(
+      (result) =>
+        result.qbtcpResultId !== undefined &&
+        result.status === ImportResultStatus.Success &&
+        result.proceedWithImport &&
+        result.match !== undefined &&
+        result.round !== undefined &&
+        result.comparison?.kind === 'new' &&
+        result.messages.length === 0,
+    )
+  );
 }
 
 /** React context that elements can use to access the TournamentManager and its data without

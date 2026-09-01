@@ -522,9 +522,14 @@ export class Phase implements IQbjPhase, IYftDataModelObject {
     if (oldName === newName || oldName === '') return;
 
     for (const rd of this.rounds) {
+      let changed = false;
       for (const game of rd.scheduledGames) {
-        if (game.poolName === oldName) game.poolName = newName;
+        if (game.poolName === oldName) {
+          game.poolName = newName;
+          changed = true;
+        }
       }
+      if (changed) rd.touchScheduledGamesRevision();
     }
   }
 
@@ -538,7 +543,7 @@ export class Phase implements IQbjPhase, IYftDataModelObject {
   /** Remove every pairing in this phase. Caller is responsible for deciding that's safe. */
   clearScheduledGames() {
     for (const rd of this.rounds) {
-      rd.scheduledGames = [];
+      rd.clearScheduledGames();
     }
   }
 

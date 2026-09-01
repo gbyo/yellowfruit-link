@@ -335,6 +335,7 @@ export function generatePairingsForPool(
   }
 
   const existing = existingGamesForPool(phase, pool);
+  const touchedRounds = new Set<Round>();
   if (existing.length > 0) {
     if (mode === PairingGenerationMode.FillOnly) {
       outcome.skipped.push(`${pool.name}: already has pairings.`);
@@ -355,8 +356,12 @@ export function generatePairingsForPool(
       outcome.skipped.push(`${pool.name}: cannot be regenerated because ${blocked.join('; ')}.`);
       return outcome;
     }
+    // A replacement is a new issue of every round it touches. This revision is deliberately
+    // independent from the per-room assignment revision: a room can keep scoring an assignment
+    // from an older issue while the director regenerates another pool in the same tournament.
+    for (const entry of existing) touchedRounds.add(entry.round);
     for (const entry of existing) {
-      entry.round.deleteScheduledGame(entry.game);
+      entry.round.deleteScheduledGame(entry.game, { bumpRevision: false });
       outcome.gamesRemoved++;
     }
   }
@@ -370,9 +375,12 @@ export function generatePairingsForPool(
     if (!round) continue;
     round.addScheduledGame(
       new ScheduledGame(pairing.leftTeam, pairing.rightTeam, { poolName: pool.name, generated: true }),
+      { bumpRevision: false },
     );
+    touchedRounds.add(round);
     outcome.gamesCreated++;
   }
+  for (const round of touchedRounds) round.touchScheduledGamesRevision();
   return outcome;
 }
 

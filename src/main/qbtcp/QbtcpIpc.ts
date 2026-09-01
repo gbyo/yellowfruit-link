@@ -101,7 +101,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
     // session it ever had: `find` would return the oldest, so a room whose assignment was just
     // cleared would report "Final received" for a game from hours ago.
     const session = assignment
-      ? roomSessions.find((s) => s.matchId === assignment.matchId)
+      ? [...roomSessions].reverse().find((s) => s.matchId === assignment.matchId)
       : roomSessions[roomSessions.length - 1];
     const presence = state.presence.find((p) => p.roomId === room.id);
     const tossupsRead = readTossupsRead(session?.progressMatch);
@@ -124,6 +124,9 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
       connected: instance.running && Number.isFinite(lastSeen) && Date.now() - lastSeen < presenceFreshMs,
       ...(presence?.lastSeenAt ? { lastSeenAt: presence.lastSeenAt } : {}),
       ...(presence?.operatorName ? { operatorName: presence.operatorName } : {}),
+      ...(presence?.client ? { client: presence.client } : {}),
+      ...(presence?.procedureVersions ? { procedureVersions: presence.procedureVersions } : {}),
+      ...(presence?.qbjVersion ? { qbjVersion: presence.qbjVersion } : {}),
       ...(assignment
         ? {
             assignment: {
@@ -133,6 +136,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
               rightTeamName: assignment.rightTeamName,
               matchId: assignment.matchId,
               revision: assignment.revision,
+              ...(assignment.roundRevision !== undefined ? { roundRevision: assignment.roundRevision } : {}),
             },
           }
         : {}),
@@ -141,6 +145,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
             session: {
               id: session.id,
               scoring: session.progressSequence > 0,
+              status: session.status,
               ...(tossupsRead !== undefined ? { tossupsRead } : {}),
               finalReceived: session.finalReceived,
             },
@@ -153,12 +158,38 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
               status: result.status,
               fingerprint: result.fingerprint,
               receivedAt: result.receivedAt,
+              ...(result.warnings && result.warnings.length > 0
+                ? {
+                    warningCount: result.warnings.length,
+                    warningCodes: result.warnings.map((warning) => warning.code),
+                  }
+                : {}),
             },
           }
         : {}),
       helpRequests: state.helpRequests.filter((request) => request.roomId === room.id && request.status === 'open'),
     };
   });
+
+  // Keep a global queue as well as the per-room result cell. A room may already have received its
+  // next assignment, so its previous result is no longer the current row result; the receipt still
+  // needs a quiet, durable place for the director to reopen after cancelling a modal.
+  const reviewQueue = state.results
+    .filter((result) => result.status === 'needs-review' || result.status === 'conflict')
+    .map((result) => {
+      const room = state.rooms.find((entry) => entry.id === result.roomId);
+      const roundNumber = result.roundNumber ?? result.context?.expectedRoundNumber;
+      return {
+        id: result.id,
+        roomId: result.roomId,
+        roomName: room?.name ?? 'Removed room',
+        matchId: result.matchId,
+        ...(roundNumber !== undefined ? { roundNumber } : {}),
+        status: result.status === 'conflict' ? ('conflict' as const) : ('needs-review' as const),
+        receivedAt: result.receivedAt,
+        ...(result.warnings && result.warnings.length > 0 ? { warningCount: result.warnings.length } : {}),
+      };
+    });
 
   return {
     running: instance.running,
@@ -168,6 +199,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
     ...(instance.problem ? { error: instance.problem } : {}),
     hasActiveWork: instance.hasActiveWork(),
     rooms,
+    reviewQueue,
   };
 }
 
@@ -229,6 +261,7 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
           matchId: command.matchId,
           document: command.document,
         },
+        command.assignmentRevision,
         command.roundRevision,
       );
       if ('assigned' in outcome && !outcome.assigned) return { ok: false, error: outcome.reason };
@@ -237,6 +270,26 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
     case 'clearAssignment': {
       const outcome = await instance.clearAssignment(command.roomId);
       if (!outcome.cleared) return { ok: false, error: outcome.reason ?? 'That assignment could not be cleared.' };
+      return { ok: true, status: buildStatus(instance) };
+    }
+    case 'abandonSession': {
+      const outcome = await instance.abandonSession(command.sessionId, command.reason);
+      if (!outcome.abandoned) return { ok: false, error: outcome.reason ?? 'That session could not be abandoned.' };
+      return {
+        ok: true,
+        abandoned: true,
+        progressSequence: outcome.progressSequence,
+        hadProgress: outcome.hadProgress,
+        ...(outcome.warning ? { warning: outcome.warning } : {}),
+      };
+    }
+    case 'reviewResult': {
+      const outcome = await instance.reviewResult(command.resultId, {
+        decision: command.decision,
+        ...(command.existingResultId ? { existingResultId: command.existingResultId } : {}),
+        ...(command.reason !== undefined ? { reason: command.reason } : {}),
+      });
+      if (!outcome.reviewed) return { ok: false, error: outcome.reason ?? 'That result could not be reviewed.' };
       return { ok: true, status: buildStatus(instance) };
     }
     case 'resolveResult':

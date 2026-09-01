@@ -20,9 +20,10 @@ import { Cancel, Close, Upload } from '@mui/icons-material';
 import { TournamentContext } from '../TournamentManager';
 import useSubscription from '../Utils/CustomHooks';
 import { YfAcceptButton, YfCancelButton } from '../Utils/GeneralReactUtils';
-import { MatchImportResultsModalContext } from '../Modal Managers/MatchImportResultsManager';
+import MatchImportResultsManager, { MatchImportResultsModalContext } from '../Modal Managers/MatchImportResultsManager';
 import MatchImportResult, { ImportResultStatus } from '../DataModel/MatchImportResult';
 import { getFileNameFromPath } from '../Utils/GeneralUtils';
+import type { ResultReviewDecision } from '../../qbtcp/QbtcpState';
 
 export default function MatchImportResultDialog() {
   const tournManager = useContext(TournamentContext);
@@ -70,6 +71,7 @@ function MatchImportResultDialogCore() {
   const errs = allResults.filter((r) => r.status === ImportResultStatus.ErrNonFatal);
   const fatals = allResults.filter((r) => r.status === ImportResultStatus.FatalErr);
   const couldImportAnything = successes.length > 0 || warnings.length > 0 || errs.length > 0;
+  const couldFinishReview = couldImportAnything || allResults.some((result) => result.qbtcpResultId);
   const dialogTitle = round ? `Round ${round.name} Import Preview` : 'Import Preview';
 
   const handleAccept = () => {
@@ -82,7 +84,7 @@ function MatchImportResultDialogCore() {
   };
 
   useHotkeys('alt+c', () => handleCancel(), { enabled: isOpen, enableOnFormTags: true });
-  useHotkeys('alt+a', () => handleAccept(), { enabled: isOpen && couldImportAnything, enableOnFormTags: true });
+  useHotkeys('alt+a', () => handleAccept(), { enabled: isOpen && couldFinishReview, enableOnFormTags: true });
 
   return (
     <Dialog open={isOpen} fullWidth maxWidth="xl" onClose={handleCancel}>
@@ -141,7 +143,7 @@ function MatchImportResultDialogCore() {
       </DialogContent>
       <DialogActions>
         <YfCancelButton onClick={handleCancel} />
-        <YfAcceptButton onClick={handleAccept} disabled={!couldImportAnything} ref={acceptButtonRef} />
+        <YfAcceptButton onClick={handleAccept} disabled={!couldFinishReview} ref={acceptButtonRef} />
       </DialogActions>
     </Dialog>
   );
@@ -183,13 +185,21 @@ const toggleOptions = {
   discard: 'Discard',
 };
 
+const qbtcpToggleOptions = {
+  accept: 'Import',
+  supersede: 'Replace',
+  keepExisting: 'Keep existing',
+  dismiss: 'Dismiss',
+} as const;
+
 function ResultTableRow(props: IResultTableRowProps) {
   const { result, showRoundCol } = props;
   const modalManager = useContext(MatchImportResultsModalContext);
   const [keepResult, setKeepResult] = useSubscription(result.proceedWithImport);
+  const [qbtcpAction, setQbtcpAction] = useSubscription(result.qbtcpReviewAction);
   if (result.status === undefined) return null;
 
-  const cols = getColumnList(result.status, showRoundCol);
+  const cols = getColumnList(result, showRoundCol);
 
   return (
     <TableRow>
@@ -207,25 +217,34 @@ function ResultTableRow(props: IResultTableRowProps) {
       )}
       {cols.includes(ResultTableColumns.ImportOrSkip) && (
         <TableCell width="10%">
-          <ToggleButtonGroup
-            size="small"
-            color="primary"
-            exclusive
-            value={keepResult ? toggleOptions.keep : toggleOptions.discard}
-            onChange={(e, newValue) => {
-              if (newValue === null) return;
-              setKeepResult(newValue === toggleOptions.keep);
-              modalManager.setProceedWithImport(result, newValue === toggleOptions.keep);
-            }}
-          >
-            <ToggleButton value={toggleOptions.keep}>
-              <Upload />
-              {toggleOptions.keep}
-            </ToggleButton>
-            <ToggleButton value={toggleOptions.discard}>
-              <Close /> {toggleOptions.discard}
-            </ToggleButton>
-          </ToggleButtonGroup>
+          {result.qbtcpResultId ? (
+            <QbtcpReviewControls
+              result={result}
+              action={qbtcpAction}
+              setAction={setQbtcpAction}
+              modalManager={modalManager}
+            />
+          ) : (
+            <ToggleButtonGroup
+              size="small"
+              color="primary"
+              exclusive
+              value={keepResult ? toggleOptions.keep : toggleOptions.discard}
+              onChange={(e, newValue) => {
+                if (newValue === null) return;
+                setKeepResult(newValue === toggleOptions.keep);
+                modalManager.setProceedWithImport(result, newValue === toggleOptions.keep);
+              }}
+            >
+              <ToggleButton value={toggleOptions.keep}>
+                <Upload />
+                {toggleOptions.keep}
+              </ToggleButton>
+              <ToggleButton value={toggleOptions.discard}>
+                <Close /> {toggleOptions.discard}
+              </ToggleButton>
+            </ToggleButtonGroup>
+          )}
         </TableCell>
       )}
     </TableRow>
@@ -247,7 +266,8 @@ function MessageList(props: IMessageListProps) {
   ));
 }
 
-function getColumnList(status: ImportResultStatus, showRoundCol: boolean) {
+function getColumnList(result: MatchImportResult, showRoundCol: boolean) {
+  const { status } = result;
   const cols: ResultTableColumns[] = [];
   if (showRoundCol) {
     cols.push(ResultTableColumns.RoundNo);
@@ -260,8 +280,68 @@ function getColumnList(status: ImportResultStatus, showRoundCol: boolean) {
   if (status !== ImportResultStatus.Success) {
     cols.push(ResultTableColumns.Message);
   }
-  if (status !== ImportResultStatus.FatalErr) {
+  if (status !== ImportResultStatus.FatalErr || result.qbtcpResultId) {
     cols.push(ResultTableColumns.ImportOrSkip);
   }
   return cols;
+}
+
+interface IQbtcpReviewControlsProps {
+  result: MatchImportResult;
+  action: ResultReviewDecision | undefined;
+  setAction: (action: ResultReviewDecision | undefined) => void;
+  modalManager: MatchImportResultsManager;
+}
+
+function QbtcpReviewControls(props: IQbtcpReviewControlsProps) {
+  const { result, action, setAction, modalManager } = props;
+  const conflict = result.comparison?.kind === 'conflict';
+  let selectedAction: ResultReviewDecision;
+  if (action) selectedAction = action;
+  else if (conflict) selectedAction = 'keep-existing';
+  else selectedAction = result.proceedWithImport ? 'accept' : 'dismiss';
+  const existingResultId =
+    result.qbtcpExistingResultId ??
+    (result.comparison?.kind === 'conflict' || result.comparison?.kind === 'duplicate'
+      ? result.comparison.existingId
+      : undefined);
+  const choose = (newValue: string | null) => {
+    if (newValue === null) return;
+    const next = newValue as ResultReviewDecision;
+    if (!['accept', 'keep-existing', 'dismiss', 'supersede'].includes(next)) return;
+    setAction(next);
+    modalManager.setQbtcpReviewAction(result, next, existingResultId);
+  };
+
+  return (
+    <ToggleButtonGroup
+      size="small"
+      color="primary"
+      exclusive
+      value={selectedAction}
+      onChange={(e, value) => choose(value)}
+    >
+      {conflict && (
+        <>
+          <ToggleButton value="supersede" title="Import this result and supersede the existing result">
+            <Upload />
+            {qbtcpToggleOptions.supersede}
+          </ToggleButton>
+          <ToggleButton value="keep-existing" title="Keep the existing result and dismiss this result">
+            {qbtcpToggleOptions.keepExisting}
+          </ToggleButton>
+        </>
+      )}
+      {!conflict && (
+        <ToggleButton value="accept">
+          <Upload />
+          {qbtcpToggleOptions.accept}
+        </ToggleButton>
+      )}
+      <ToggleButton value="dismiss">
+        <Close />
+        {qbtcpToggleOptions.dismiss}
+      </ToggleButton>
+    </ToggleButtonGroup>
+  );
 }

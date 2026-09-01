@@ -40,6 +40,7 @@ import { IRoomView } from '../../qbtcp/QbtcpState';
 import { isValidQbtcpPort, presenceFreshMs, qbtcpHelpCategoryLabels } from '../../qbtcp/QbtcpProtocol';
 import { Round } from '../DataModel/Round';
 import { LinkButton } from '../Utils/GeneralReactUtils';
+import { roomResultPresentation } from '../RoomsStatus';
 
 /**
  * How often this page re-reads room status while it is open.
@@ -69,6 +70,7 @@ function RoomsPage() {
   }, [rooms]);
 
   const { status } = rooms;
+  const reviewQueue = status.reviewQueue ?? [];
 
   return (
     <>
@@ -81,6 +83,26 @@ function RoomsPage() {
         <Grid xs={12}>
           <ServerCard />
         </Grid>
+        {reviewQueue.length > 0 && (
+          <Grid xs={12}>
+            <Alert severity="warning">
+              <Stack spacing={0.5}>
+                <Typography variant="subtitle2">Review queue ({reviewQueue.length})</Typography>
+                {reviewQueue.map((entry) => (
+                  <Stack key={entry.id} direction="row" spacing={1} alignItems="center">
+                    <Typography variant="body2">
+                      {entry.roomName} · {entry.roundNumber !== undefined ? `Round ${entry.roundNumber} · ` : ''}
+                      {entry.matchId || 'unidentified result'}
+                    </Typography>
+                    <Button size="small" onClick={() => tournManager.reviewQbtcpResult(entry.id)}>
+                      Review
+                    </Button>
+                  </Stack>
+                ))}
+              </Stack>
+            </Alert>
+          </Grid>
+        )}
         <Grid xs={12}>
           <YfCard
             title="Rooms"
@@ -219,12 +241,13 @@ function RoomRow(props: IRoomRowProps) {
   const { room } = props;
   const tournManager = useContext(TournamentContext);
   const rooms = tournManager.roomsManager;
-  // A received final is not a settled game. Until the director has decided what to do with it, the
-  // pairing it was scored against has to stay put, or the review ends up pointing at a game this
-  // room is no longer playing. The main process refuses these commands for the same reason.
-  const awaitingReview = room.result?.status === 'needs-review' || room.result?.status === 'conflict';
-  const assignmentLocked = (!!room.session && !room.session.finalReceived) || awaitingReview;
-  const lockReason = awaitingReview ? 'Review this room’s result' : 'Finish the current scoring session';
+  // A received final is durable evidence, not an open scoring session. Review must not hold the
+  // room or its next assignment: the server keeps the receipt and its pairing identity while the
+  // director works through the queue.
+  const sessionOpen = !!room.session && room.session.status !== 'abandoned' && !room.session.finalReceived;
+  const assignmentLocked = sessionOpen;
+  const sessionCanBeAbandoned = !!room.session && !room.session.finalReceived && room.session.status !== 'abandoned';
+  const lockReason = 'Finish the current scoring session';
   const openHelpRequests = room.helpRequests ?? [];
   const removalLocked = assignmentLocked || openHelpRequests.length > 0;
   const removalLockReason =
@@ -240,6 +263,11 @@ function RoomRow(props: IRoomRowProps) {
         <TableCell sx={{ fontFamily: 'monospace' }}>{room.pairingCode}</TableCell>
         <TableCell>
           <ConnectionCell room={room} />
+          {room.client && (
+            <Typography variant="caption" display="block" color="text.secondary" sx={{ mt: 0.5 }}>
+              {clientLabel(room)}
+            </Typography>
+          )}
         </TableCell>
         <TableCell>
           {room.assignment
@@ -254,6 +282,34 @@ function RoomRow(props: IRoomRowProps) {
         </TableCell>
         <TableCell align="right">
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+            {sessionCanBeAbandoned && (
+              <Tooltip title="Release this room session and its current assignment">
+                <Button
+                  size="small"
+                  color="warning"
+                  disabled={rooms.busy}
+                  onClick={() =>
+                    tournManager.genericModalManager.open(
+                      'Abandon Session',
+                      `Release ${room.name}'s current scoring session? Any progress remains in the session record and will not be imported as a result.`,
+                      'Cancel',
+                      'Abandon Session',
+                      () => {
+                        rooms
+                          .abandonSession(room.session!.id, 'Abandoned from Rooms page')
+                          .then((outcome) => {
+                            if (outcome.warning) tournManager.makeToast(outcome.warning, 'warning');
+                            return undefined;
+                          })
+                          .catch(() => undefined);
+                      },
+                    )
+                  }
+                >
+                  Abandon Session
+                </Button>
+              </Tooltip>
+            )}
             <Tooltip describeChild title={assignmentLocked ? `${lockReason} before changing the assignment.` : ''}>
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
               <span tabIndex={assignmentLocked ? 0 : undefined} style={{ display: 'inline-flex' }}>
@@ -392,7 +448,8 @@ function HelpCell(props: IRoomRowProps) {
  */
 function ConnectionCell(props: IRoomRowProps) {
   const { room } = props;
-  if (room.session?.finalReceived) return <Chip size="small" color="success" label="Final received" />;
+  if (room.session?.status === 'abandoned') return <Chip size="small" variant="outlined" label="Session abandoned" />;
+  if (room.session?.finalReceived) return <Chip size="small" color="success" label="Result received" />;
   if (!room.paired) return <Chip size="small" variant="outlined" label="Not paired" />;
   if (!room.connected) {
     return <Chip size="small" variant="outlined" label={room.lastSeenAt ? 'Stale' : 'Waiting'} />;
@@ -404,41 +461,34 @@ function ConnectionCell(props: IRoomRowProps) {
   return <Chip size="small" color="success" variant="outlined" label="Connected" />;
 }
 
+function clientLabel(room: IRoomView): string {
+  const { client } = room;
+  if (!client) return '';
+  const name = client.name ?? 'QBSheet';
+  const version = client.version ? ` ${client.version}` : '';
+  const build = client.build ? ` · ${client.build}` : '';
+  return `${name}${version}${build}`;
+}
+
 function ResultCell(props: IRoomRowProps) {
   const { room } = props;
   const tournManager = useContext(TournamentContext);
   const { result } = room;
   if (!result) return <span>—</span>;
-  switch (result.status) {
-    case 'needs-review':
-      return (
-        <Chip
-          size="small"
-          color="warning"
-          clickable
-          label="Needs review · Review"
-          title="Open result review"
-          onClick={() => tournManager.reviewQbtcpResult(result.id)}
-        />
-      );
-    case 'accepted':
-      return <Chip size="small" color="success" label="Accepted" />;
-    case 'duplicate':
-      return <Chip size="small" variant="outlined" label="Already recorded" />;
-    case 'conflict':
-      return (
-        <Chip
-          size="small"
-          color="error"
-          clickable
-          label="Conflict · Review"
-          title="Open result review"
-          onClick={() => tournManager.reviewQbtcpResult(result.id)}
-        />
-      );
-    default:
-      return <span>—</span>;
+  const presentation = roomResultPresentation(result.status);
+  if (!presentation.requiresReview) {
+    return <Chip size="small" color={presentation.tone} label={presentation.label} />;
   }
+  return (
+    <Chip
+      size="small"
+      color={presentation.tone}
+      clickable
+      label={`${presentation.label} · Review`}
+      title="Open result review"
+      onClick={() => tournManager.reviewQbtcpResult(result.id)}
+    />
+  );
 }
 
 interface IAssignDialogProps {

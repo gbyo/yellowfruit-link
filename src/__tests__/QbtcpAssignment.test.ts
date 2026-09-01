@@ -102,6 +102,60 @@ test('the match carries the room and the _qbtcp operational block', () => {
   expect(extension.scorekeeper).toEqual({ timed: false });
 });
 
+test('the assignment carries the neutral default room procedure', () => {
+  const { document } = buildFixtureAssignment();
+  const match = objectsOfType(document, 'Match')[0];
+  const extension = JSON.parse(JSON.stringify(match._qbtcp)) as Record<string, unknown>;
+
+  expect(extension.procedure).toEqual({ version: 3, halves: false, timeoutsPerTeam: 0 });
+  expect(extension.handoff_instruction).toBeUndefined();
+});
+
+test('a round procedure and handoff override are resolved into the assignment snapshot', () => {
+  const tournament = makeTestTournament();
+  tournament.roomProcedure = {
+    version: 3,
+    halves: true,
+    breaks: [{ afterTossup: 10, label: 'Tournament break' }],
+    halfLengthMinutes: 25,
+    timeoutsPerTeam: 1,
+    timeoutDurationSeconds: 60,
+    protestCheckpoints: 'phase-boundaries',
+    substitutionPolicy: 'any-boundary',
+  };
+  tournament.handoffInstruction = 'Tournament handoff';
+  const round = roundNumbered(tournament, 4);
+  round.roomProcedure = {
+    version: 3,
+    halves: false,
+    timeoutsPerTeam: 2,
+    timeoutDurationSeconds: 45,
+    protestCheckpoints: 'strict-overtime',
+    substitutionPolicy: 'breaks-timeouts-overtime',
+  };
+  round.handoffInstruction = 'Round handoff';
+  const phase = tournament.findPhaseByRound(round);
+  if (!phase) throw new Error('fixture round has no phase');
+
+  const document = buildAssignmentDocument({
+    tournament,
+    phase,
+    round,
+    leftTeam: teamNamed(tournament, 'Ninety Six'),
+    rightTeam: teamNamed(tournament, 'Greenwood'),
+    matchId: 'Match_procedure',
+    roomName: 'Room 204',
+    roomId: 'room-204',
+    roundRevision: 1,
+  });
+  const match = objectsOfType(document, 'Match')[0];
+  const extension = JSON.parse(JSON.stringify(match._qbtcp)) as Record<string, unknown>;
+
+  expect(extension.procedure).toEqual(round.roomProcedure);
+  expect(extension.handoff_instruction).toBe('Round handoff');
+  expect(extension.scorekeeper).toEqual({ timed: false });
+});
+
 test('_qbtcp restates no identity that standard QBJ already carries', () => {
   const { document } = buildFixtureAssignment();
   const extension = objectsOfType(document, 'Match')[0]._qbtcp as Record<string, unknown>;

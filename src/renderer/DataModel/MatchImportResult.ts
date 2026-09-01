@@ -1,4 +1,5 @@
 import { ResultComparison } from '../../qbtcp/ResultFingerprint';
+import { ResultReviewDecision } from '../../qbtcp/QbtcpState';
 import { Match } from './Match';
 import { Phase } from './Phase';
 import { Round } from './Round';
@@ -41,6 +42,18 @@ class MatchImportResult {
 
   /** How this one game stands against what the Rooms adapter already has on record. */
   comparison?: ResultComparison;
+
+  /** The durable QBTCP receipt this preview is reconciling, when the source was the network. */
+  qbtcpResultId?: string;
+
+  /** Explicit director choice for a retained QBTCP result. */
+  qbtcpReviewAction?: ResultReviewDecision;
+
+  /** Existing receipt selected by Replace/Keep existing. */
+  qbtcpExistingResultId?: string;
+
+  /** Optional audit note supplied with the explicit review action. */
+  qbtcpReviewReason?: string;
 
   constructor(filePath: string) {
     this.filePath = filePath;
