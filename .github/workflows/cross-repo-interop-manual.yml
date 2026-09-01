@@ -18,6 +18,9 @@ concurrency:
 
 jobs:
   browser-contract:
+    # Configure required reviewers on this environment before permitting arbitrary companion refs.
+    environment:
+      name: qbtcp-untrusted-interop
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
