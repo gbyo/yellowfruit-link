@@ -12,21 +12,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # This cache lives only inside the disposable runner workspace; it is never an Actions cache.
+  NPM_CONFIG_CACHE: ${{ github.workspace }}/.qbtcp-npm-cache
+
 concurrency:
   group: cross-repo-interop-manual-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   browser-contract:
-    # Configure required reviewers on this environment before permitting arbitrary companion refs.
-    environment:
-      name: qbtcp-untrusted-interop
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - name: Check out YellowFruit
         uses: actions/checkout@v7
-
+        with:
+          persist-credentials: false
       - name: Resolve QBSheet companion ref
         id: resolve-qbsheet
         env:
@@ -45,12 +47,15 @@ jobs:
           echo "ref=$candidate" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Check out QBSheet companion
-        uses: actions/checkout@v7
-        with:
-          repository: gbyo/qbsheet
-          ref: ${{ steps.resolve-qbsheet.outputs.sha }}
-          path: qbsheet
+      - name: Fetch QBSheet companion
+        env:
+          COMPANION_COMMIT: ${{ steps.resolve-qbsheet.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init --quiet qbsheet
+          git -C qbsheet fetch --no-tags --depth=1 \
+            https://github.com/gbyo/qbsheet.git "$COMPANION_COMMIT"
+          git -C qbsheet checkout --detach FETCH_HEAD
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
