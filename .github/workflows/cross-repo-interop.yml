@@ -61,7 +61,7 @@ jobs:
             qbsheet/package-lock.json
 
       - name: Install YellowFruit dependencies
-        run: npm ci --ignore-scripts
+        run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: Install QBSheet dependencies
         working-directory: qbsheet
