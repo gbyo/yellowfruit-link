@@ -1,14 +1,19 @@
-name: Cross-repository interop
+name: Cross-repository interop (manual)
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      qbsheet_ref:
+        description: Optional QBSheet branch or ref; otherwise use the default branch
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: cross-repo-interop-${{ github.ref }}
+  group: cross-repo-interop-manual-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -22,10 +27,11 @@ jobs:
       - name: Resolve QBSheet companion ref
         id: resolve-qbsheet
         env:
-          CANDIDATE_REF: ${{ github.head_ref || github.ref_name }}
+          REQUESTED_REF: ${{ inputs.qbsheet_ref }}
+          CANDIDATE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          candidate="$CANDIDATE_REF"
+          candidate="${REQUESTED_REF:-$CANDIDATE_REF}"
           if [ -z "$candidate" ]; then candidate=main; fi
           remote_line="$(git ls-remote https://github.com/gbyo/qbsheet.git "refs/heads/$candidate" || true)"
           if [ -z "$remote_line" ]; then
@@ -47,8 +53,6 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: package-lock.json
 
       - name: Install YellowFruit dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
@@ -76,7 +80,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cross-repo-interop-playwright
+          name: cross-repo-interop-manual-playwright
           path: |
             qbsheet/playwright-report/
             qbsheet/test-results/
