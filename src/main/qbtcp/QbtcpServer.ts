@@ -58,7 +58,11 @@ import {
   IQbtcpRosterPlayerRequest,
   ISession,
   ISessionGrant,
+  IResultReviewRequest,
+  ResultReviewDecision,
+  QbtcpSessionStatus,
   QbtcpRosterPlayerOutcome,
+  IQbtcpRosterAmendment,
   emptyQbtcpState,
 } from '../../qbtcp/QbtcpState';
 import {
@@ -68,8 +72,15 @@ import {
   readResultIdentities,
   readResultIdentity,
   readResultSourceMetadata,
+  resultFingerprint,
   stripCredentialKeys,
 } from '../../qbtcp/ResultFingerprint';
+import {
+  discrepancyMessage,
+  IResultDiscrepancy,
+  IResultReceiptContext,
+  resultDiscrepancies,
+} from '../../qbtcp/ResultDiscrepancy';
 import { normalizeScoresheetUrl } from '../../qbtcp/PairingLaunch';
 import { makeOpaqueId } from '../../SharedUtils';
 import QbtcpStore from './QbtcpStore';
@@ -171,10 +182,12 @@ export default class QbtcpServer {
       chosen && !defaultAllowedOrigins.includes(chosen) ? [...defaultAllowedOrigins, chosen] : defaultAllowedOrigins;
   }
 
-  /** Whether a result for this room is still waiting for the director to decide what to do with it. */
-  private hasUnresolvedResult(roomId: string): boolean {
+  /** A pending result follows its scheduled game, never the physical room that received it. */
+  private hasUnresolvedResultForMatch(matchId: string): boolean {
     return this.state.results.some(
-      (result) => result.roomId === roomId && (result.status === 'needs-review' || result.status === 'conflict'),
+      (result) =>
+        (result.matchId === matchId || result.expectedMatchId === matchId) &&
+        (result.status === 'needs-review' || result.status === 'conflict'),
     );
   }
 
@@ -186,7 +199,7 @@ export default class QbtcpServer {
     if (unresolvedResult) return true;
     // Opening a session is enough to make the assignment live. Progress is best effort and may never
     // arrive before a device goes offline, so it must not decide whether a game can be replaced.
-    return this.state.sessions.some((session) => !session.finalReceived);
+    return this.state.sessions.some((session) => sessionStatus(session) === 'open');
   }
 
   async start(port: number): Promise<void> {
@@ -273,6 +286,28 @@ export default class QbtcpServer {
     return this.state;
   }
 
+  private assignmentContextForSession(
+    room: IRoom,
+    assignment: IRoomAssignment,
+    sessionId: string,
+  ): IResultReceiptContext {
+    return {
+      tournamentId: this.state.tournamentId,
+      roomId: room.id,
+      roomName: room.name,
+      sessionId,
+      assignmentId: assignment.id,
+      expectedMatchId: assignment.matchId,
+      expectedRoundNumber: assignment.roundNumber,
+      expectedAssignmentRevision: assignment.revision,
+      expectedRoundRevision: assignment.roundRevision ?? 1,
+      expectedLeftTeamId: assignment.leftTeamId,
+      expectedRightTeamId: assignment.rightTeamId,
+      expectedLeftTeamName: assignment.leftTeamName,
+      expectedRightTeamName: assignment.rightTeamName,
+    };
+  }
+
   async addRoom(name: string): Promise<IRoom> {
     const room: IRoom = {
       id: makeOpaqueId('room-', 6),
@@ -304,27 +339,23 @@ export default class QbtcpServer {
   /**
    * Remove a room, but only when nothing would be lost with it.
    *
-   * An assigned room, an unfinished session, or one whose result nobody has dealt with, is refused
-   * rather than removed. The caller reports that to the director; silently discarding a game to satisfy
-   * a click is not a recoverable mistake.
+   * An assigned room, an unfinished session, or an open help request is refused rather than removed.
+   * Terminal sessions and received results stay in operational history after a room is removed, so
+   * removing the physical room does not discard evidence the director may still need.
    */
   async removeRoom(roomId: string): Promise<{ removed: boolean; reason?: string }> {
     if (this.state.assignments.some((a) => a.roomId === roomId)) {
       return { removed: false, reason: 'Clear this room’s assignment before removing it.' };
     }
-    if (this.state.sessions.some((session) => session.roomId === roomId && !session.finalReceived)) {
+    if (this.state.sessions.some((session) => session.roomId === roomId && sessionStatus(session) === 'open')) {
       return { removed: false, reason: 'This room has an unfinished scoring session.' };
-    }
-    if (
-      this.state.results.some((r) => r.roomId === roomId && (r.status === 'needs-review' || r.status === 'conflict'))
-    ) {
-      return { removed: false, reason: 'This room has a result waiting for review.' };
     }
     if (this.state.helpRequests.some((request) => request.roomId === roomId && request.status === 'open')) {
       return { removed: false, reason: 'This room has an open help request. Resolve it before removing the room.' };
     }
     this.state.rooms = this.state.rooms.filter((room) => room.id !== roomId);
-    this.state.sessions = this.state.sessions.filter((session) => session.roomId !== roomId);
+    // Terminal sessions and results are audit evidence. Removing a room must not make a late retry or
+    // a received result disappear with the physical room record.
     this.state.presence = this.state.presence.filter((entry) => entry.roomId !== roomId);
     await this.store.save(this.state);
     return { removed: true };
@@ -335,10 +366,8 @@ export default class QbtcpServer {
    *
    * The revision increases whenever a room's assignment is replaced, so that a result scored against
    * a superseded pairing is detectable rather than indistinguishable from a current one. An unfinished
-   * session locks the room even when no progress snapshot has arrived yet, and so does a received
-   * result nobody has decided about: `finalReceived` only means the bytes are safe on disk, not that
-   * the game is settled, and replacing the assignment underneath it would leave the review pointing at
-   * a pairing this room is no longer playing.
+   * session locks the room even when no progress snapshot has arrived yet. Once a final is durably
+   * received, the room may move on while the result remains attached to its immutable context.
    *
    * `expectedRevision` is the revision the caller baked into the document it is handing over. The
    * renderer computes it from the status it last saw, so two commands issued from one stale snapshot
@@ -348,23 +377,35 @@ export default class QbtcpServer {
    */
   async setAssignment(
     assignment: Omit<IRoomAssignment, 'id' | 'revision'>,
-    expectedRevision?: number,
+    expectedAssignmentRevision?: number,
+    roundRevision?: number,
   ): Promise<IRoomAssignment | { assigned: false; reason: string }> {
-    if (this.state.sessions.some((session) => session.roomId === assignment.roomId && !session.finalReceived)) {
+    if (
+      this.state.sessions.some((session) => session.roomId === assignment.roomId && sessionStatus(session) === 'open')
+    ) {
       return {
         assigned: false,
         reason: 'This room has an unfinished scoring session. Wait for its result before changing the assignment.',
       };
     }
-    if (this.hasUnresolvedResult(assignment.roomId)) {
+    const otherAssignment = this.state.assignments.find(
+      (entry) => entry.matchId === assignment.matchId && entry.roomId !== assignment.roomId,
+    );
+    if (otherAssignment) {
       return {
         assigned: false,
-        reason: 'This room has a result waiting for review. Resolve it before changing the assignment.',
+        reason: 'That scheduled game is already assigned to another room.',
+      };
+    }
+    if (this.hasUnresolvedResultForMatch(assignment.matchId)) {
+      return {
+        assigned: false,
+        reason: 'That scheduled game has a result waiting for review.',
       };
     }
     const previous = this.state.assignments.find((a) => a.roomId === assignment.roomId);
     const revision = (previous?.revision ?? 0) + 1;
-    if (expectedRevision !== undefined && expectedRevision !== revision) {
+    if (expectedAssignmentRevision !== undefined && expectedAssignmentRevision !== revision) {
       return {
         assigned: false,
         reason: 'The Rooms page was out of date. Refresh it and make this assignment again.',
@@ -374,6 +415,8 @@ export default class QbtcpServer {
       ...assignment,
       id: previous?.id ?? makeOpaqueId('asg-', 6),
       revision,
+      roundRevision: assignment.roundRevision ?? roundRevision ?? 1,
+      document: addAssignmentRevision(assignment.document, revision),
     };
     this.state.assignments = this.state.assignments.filter((a) => a.roomId !== assignment.roomId);
     this.state.assignments.push(stored);
@@ -382,24 +425,224 @@ export default class QbtcpServer {
   }
 
   async clearAssignment(roomId: string): Promise<{ cleared: boolean; reason?: string }> {
-    const session = this.state.sessions.find((s) => s.roomId === roomId && !s.finalReceived);
+    const session = this.state.sessions.find((s) => s.roomId === roomId && sessionStatus(s) === 'open');
     if (session) {
       return { cleared: false, reason: 'This room has an unfinished scoring session. Wait for its result first.' };
-    }
-    if (this.hasUnresolvedResult(roomId)) {
-      return { cleared: false, reason: 'This room has a result waiting for review. Resolve it first.' };
     }
     this.state.assignments = this.state.assignments.filter((a) => a.roomId !== roomId);
     await this.store.save(this.state);
     return { cleared: true };
   }
 
-  /** Record what the director decided about a received result. */
+  /**
+   * Deliberately abandon an open session without deleting its progress or capability history.
+   *
+   * Abandonment is a director-side primitive, not a scorekeeper escape hatch. The session remains
+   * readable for recovery/audit, but its writer lock is revoked and its assignment is released. An
+   * already received final is terminal evidence and cannot be turned back into an abandoned session.
+   */
+  async abandonSession(
+    sessionId: string,
+    reason?: string,
+  ): Promise<{
+    abandoned: boolean;
+    reason?: string;
+    progressSequence?: number;
+    hadProgress?: boolean;
+    warning?: string;
+  }> {
+    const session = this.state.sessions.find((entry) => entry.id === sessionId);
+    if (!session) return { abandoned: false, reason: 'That scoring session does not exist.' };
+    const currentStatus = sessionStatus(session);
+    if (currentStatus === 'abandoned') {
+      return {
+        abandoned: false,
+        reason: 'That scoring session has already been abandoned.',
+        progressSequence: session.progressSequence,
+        hadProgress: session.progressSequence > 0,
+      };
+    }
+    if (currentStatus === 'final-received') {
+      return { abandoned: false, reason: 'That scoring session already has a received final.' };
+    }
+    const normalizedReason = normalizeAbandonReason(reason);
+    if (reason !== undefined && normalizedReason === undefined) {
+      return { abandoned: false, reason: 'The abandonment reason is empty or too long.' };
+    }
+
+    const { progressSequence } = session;
+    const formerWriterGrantToken = session.writerGrantToken ?? undefined;
+    const now = new Date().toISOString();
+    session.status = 'abandoned';
+    session.finalReceived = false;
+    session.writerGrantToken = null;
+    session.lateResultGrantToken = formerWriterGrantToken;
+    session.writerDeviceId = null;
+    session.abandonedAt = now;
+    session.updatedAt = now;
+    if (normalizedReason) session.abandonReason = normalizedReason;
+
+    // Only release the assignment belonging to this exact session. The snapshot in the session and
+    // any later received result remains available after the room is given another game.
+    this.state.assignments = this.state.assignments.filter(
+      (assignment) => !(assignment.roomId === session.roomId && assignment.matchId === session.matchId),
+    );
+    await this.store.save(this.state);
+    this.hooks.onStateChanged();
+    return {
+      abandoned: true,
+      progressSequence,
+      hadProgress: progressSequence > 0,
+      ...(progressSequence > 0
+        ? { warning: `This session has recorded progress through sequence ${progressSequence}.` }
+        : {}),
+    };
+  }
+
+  /**
+   * Apply an explicit director decision to a received result.
+   *
+   * A correction never overwrites its predecessor. `supersede` marks the old evidence as
+   * superseded and the incoming evidence as accepted, while `keep-existing` marks the incoming
+   * evidence dismissed and accepts the selected predecessor if it was still under review. Every
+   * transition is one durable save so a restart cannot leave half of a correction relationship.
+   */
+  async reviewResult(resultId: string, request: IResultReviewRequest): Promise<{ reviewed: boolean; reason?: string }> {
+    const result = this.state.results.find((entry) => entry.id === resultId);
+    if (!result) return { reviewed: false, reason: 'That received result does not exist.' };
+    if (!isResultReviewDecision(request.decision)) {
+      return { reviewed: false, reason: 'That result review decision is not supported.' };
+    }
+
+    if ((request.decision === 'accept' || request.decision === 'dismiss') && request.existingResultId) {
+      return { reviewed: false, reason: 'That review decision does not select an existing result.' };
+    }
+    const targetResultId =
+      request.decision === 'supersede' || request.decision === 'keep-existing'
+        ? request.existingResultId ?? result.conflictsWithResultId
+        : undefined;
+    const reason = normalizeReviewReason(request.reason);
+    if (request.reason !== undefined && reason === undefined) {
+      return { reviewed: false, reason: 'The result review reason is empty or too long.' };
+    }
+
+    // A repeated command is safe and idempotent, but a different decision must not silently
+    // reinterpret a result that has already been resolved.
+    if (result.review) {
+      return result.review.decision === request.decision && result.review.targetResultId === targetResultId
+        ? { reviewed: true }
+        : { reviewed: false, reason: 'That result has already been reviewed.' };
+    }
+    if (result.status !== 'needs-review' && result.status !== 'conflict') {
+      return { reviewed: false, reason: 'That result is not waiting for review.' };
+    }
+
+    let target: IReceivedResult | undefined;
+    if (request.decision === 'supersede' || request.decision === 'keep-existing') {
+      if (!targetResultId) {
+        if (request.decision === 'supersede') {
+          return { reviewed: false, reason: 'A correction must identify the result it replaces.' };
+        }
+        return { reviewed: false, reason: 'Keeping an existing result must identify which result to keep.' };
+      }
+      target = this.state.results.find((entry) => entry.id === targetResultId);
+      if (!target || target.id === result.id) {
+        return { reviewed: false, reason: 'The selected existing result does not exist.' };
+      }
+      if (target.matchId !== result.matchId) {
+        return { reviewed: false, reason: 'A result can only be reconciled with the same Match ID.' };
+      }
+      if (target.status === 'dismissed' || target.status === 'superseded') {
+        return { reviewed: false, reason: 'The selected existing result has already been resolved elsewhere.' };
+      }
+      if (target.supersededByResultId) {
+        return { reviewed: false, reason: 'The selected existing result has already been superseded.' };
+      }
+    }
+
+    const resolvedAt = new Date().toISOString();
+    const review = {
+      decision: request.decision,
+      resolvedAt,
+      ...(reason ? { reason } : {}),
+      ...(targetResultId ? { targetResultId } : {}),
+    };
+    const imported = (request.decision === 'accept' || request.decision === 'supersede') && request.imported === true;
+
+    if (request.decision === 'supersede' && target) {
+      target.status = 'superseded';
+      target.supersededByResultId = result.id;
+      target.review = {
+        decision: 'supersede',
+        resolvedAt,
+        ...(reason ? { reason } : {}),
+        targetResultId: result.id,
+      };
+      result.status = 'accepted';
+      result.supersedesResultId = target.id;
+      result.resolution = 'accepted';
+      result.review = review;
+      if (imported && result.matchId) result.importedMatchId = result.matchId;
+      resolveResultWarnings(result, 'accepted');
+    } else if (request.decision === 'keep-existing' && target) {
+      // A Keep decision is bookkeeping for a Match that already exists. A retained QBTCP result
+      // may look accepted in the adapter while its importer was cancelled or failed; promoting that
+      // evidence here would make the review queue lie about a Match that is not in the tournament.
+      if (target.importedMatchId && (target.status === 'needs-review' || target.status === 'conflict')) {
+        target.status = 'accepted';
+        target.resolution = 'accepted';
+        resolveResultWarnings(target, 'accepted');
+      }
+      result.status = 'dismissed';
+      result.keepsResultId = target.id;
+      result.dismissedAt = resolvedAt;
+      result.resolution = 'dismissed';
+      result.review = review;
+      resolveResultWarnings(result, 'dismissed');
+    } else if (request.decision === 'dismiss') {
+      result.status = 'dismissed';
+      result.dismissedAt = resolvedAt;
+      result.resolution = 'dismissed';
+      result.review = review;
+      resolveResultWarnings(result, 'dismissed');
+    } else {
+      result.status = 'accepted';
+      result.resolution = 'accepted';
+      result.review = review;
+      if (imported && result.matchId) result.importedMatchId = result.matchId;
+      resolveResultWarnings(result, 'accepted');
+    }
+
+    this.pruneResolvedSessionAssignment(result.sessionId);
+    if (target) this.pruneResolvedSessionAssignment(target.sessionId);
+    await this.store.save(this.state);
+    this.hooks.onStateChanged();
+    return { reviewed: true };
+  }
+
+  /**
+   * Backward-compatible status setter used by the existing importer bookkeeping path.
+   *
+   * New callers should use `reviewResult`, which records the director's actual decision and
+   * validates correction relationships. An old `accepted` reply still gets a durable review record.
+   */
   async resolveResult(resultId: string, status: IReceivedResult['status']): Promise<void> {
     const result = this.state.results.find((entry) => entry.id === resultId);
     if (!result) return;
+    if (status === 'accepted' && (result.status === 'needs-review' || result.status === 'conflict')) {
+      await this.reviewResult(resultId, { decision: 'accept' });
+      return;
+    }
     result.status = status;
+    if (status === 'accepted') {
+      result.resolution = 'accepted';
+      result.review ??= { decision: 'accept', resolvedAt: new Date().toISOString() };
+      if (result.matchId) result.importedMatchId = result.matchId;
+      resolveResultWarnings(result, 'accepted');
+    }
+    this.pruneResolvedSessionAssignment(result.sessionId);
     await this.store.save(this.state);
+    this.hooks.onStateChanged();
   }
 
   /** Mark an open request dealt with from the Rooms page. */
@@ -450,7 +693,14 @@ export default class QbtcpServer {
             result.fingerprint !== identity.fingerprint ||
             (result.status !== 'needs-review' && result.status !== 'conflict'),
         )
-        .map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
+        .map((r) => ({
+          id: r.id,
+          matchId: r.matchId,
+          fingerprint: r.fingerprint,
+          status: r.status,
+          receivedAt: r.receivedAt,
+          supersededByResultId: r.supersededByResultId,
+        })),
     );
   }
 
@@ -500,6 +750,7 @@ export default class QbtcpServer {
         // file against every one of its games would store the same day of play ten times over.
         document: stripCredentialKeys(identity.match) as object,
         receivedAt: new Date().toISOString(),
+        ...(identity.matchId ? { importedMatchId: identity.matchId } : {}),
         ...(identity.roundNumber !== undefined ? { roundNumber: identity.roundNumber } : {}),
       });
       recorded = true;
@@ -642,6 +893,10 @@ export default class QbtcpServer {
           connected: isRecent(entry?.lastSeenAt),
           ...(entry?.lastSeenAt ? { last_seen_at: entry.lastSeenAt } : {}),
           ...(entry?.operatorName ? { operator_name: entry.operatorName } : {}),
+          ...(entry?.deviceId ? { device_id: entry.deviceId } : {}),
+          ...(entry?.client ? { client: entry.client } : {}),
+          ...(entry?.procedureVersions ? { procedure_versions: entry.procedureVersions } : {}),
+          ...(entry?.qbjVersion ? { qbj_version: entry.qbjVersion } : {}),
         });
         return;
       }
@@ -764,6 +1019,7 @@ export default class QbtcpServer {
       if (session.roomId !== room.id) continue;
       session.grants = [];
       session.writerGrantToken = null;
+      session.lateResultGrantToken = undefined;
       session.writerDeviceId = null;
     }
     // The previous device's operator name and heartbeat describe somebody who is no longer this
@@ -822,7 +1078,7 @@ export default class QbtcpServer {
   private sendAssignmentStatus(room: IRoom, response: ServerResponse): void {
     const assignment = this.state.assignments.find((a) => a.roomId === room.id);
     const session = assignment
-      ? this.state.sessions.find((s) => s.roomId === room.id && s.matchId === assignment.matchId)
+      ? [...this.state.sessions].reverse().find((s) => s.roomId === room.id && s.matchId === assignment.matchId)
       : undefined;
 
     sendJson(response, 200, {
@@ -831,8 +1087,13 @@ export default class QbtcpServer {
       blocked_message: null,
       // A game whose final is already on record is finished, not resumable. Offering to resume it
       // invites a second scoring pass over a game this application has already accepted.
-      session: session ? { session_id: session.id, resumable: !session.finalReceived } : null,
+      session: session
+        ? { session_id: session.id, resumable: sessionStatus(session) === 'open', status: sessionStatus(session) }
+        : null,
       ...(assignment ? { released_round: assignment.roundNumber } : {}),
+      ...(assignment
+        ? { round_revision: assignment.roundRevision ?? 1, assignment_revision: assignment.revision }
+        : {}),
       hold_new_starts: false,
       previous: null,
       next: null,
@@ -872,7 +1133,9 @@ export default class QbtcpServer {
       return;
     }
 
-    const existing = this.state.sessions.find((s) => s.roomId === room.id && s.matchId === matchId);
+    const existing = this.state.sessions.find(
+      (s) => s.roomId === room.id && s.matchId === matchId && sessionStatus(s) !== 'abandoned',
+    );
     if (existing) {
       // A caller-supplied device id is attribution, not proof of ownership. Never reuse the writer's
       // credential merely because a new caller repeats the same id; only explicit takeover transfers it.
@@ -890,20 +1153,25 @@ export default class QbtcpServer {
         // A retry of an already-delivered final still needs its session; saying so is what stops a
         // client presenting a finished game as one it may carry on scoring.
         final_received: existing.finalReceived,
+        status: sessionStatus(existing),
       });
       return;
     }
 
     const now = new Date().toISOString();
+    const sessionId = makeOpaqueId('sess-', 8);
     const session: ISession = {
-      id: makeOpaqueId('sess-', 8),
+      id: sessionId,
       roomId: room.id,
       matchId,
       grants: [],
       writerGrantToken: null,
       writerDeviceId: deviceId ?? null,
       progressSequence: 0,
+      status: 'open',
       finalReceived: false,
+      assignmentContext: this.assignmentContextForSession(room, assignment, sessionId),
+      assignmentDocument: stripCredentialKeys(assignment.document) as object,
       createdAt: now,
       updatedAt: now,
     };
@@ -912,7 +1180,13 @@ export default class QbtcpServer {
     this.state.sessions.push(session);
     await this.store.save(this.state);
     this.hooks.onStateChanged();
-    sendJson(response, 200, { session_id: session.id, token: grant.token, writer: true, final_received: false });
+    sendJson(response, 200, {
+      session_id: session.id,
+      token: grant.token,
+      writer: true,
+      final_received: false,
+      status: 'open',
+    });
   }
 
   private async handleSessionRoute(
@@ -933,15 +1207,24 @@ export default class QbtcpServer {
     const { session, grant } = authorized;
 
     if (kind === 'recovery') {
-      const assignment = this.state.assignments.find((a) => a.matchId === session.matchId);
+      const assignment = this.state.assignments.find(
+        (a) => a.roomId === session.roomId && a.matchId === session.matchId,
+      );
+      const context = session.assignmentContext;
+      const roundRevision = context?.expectedRoundRevision ?? assignment?.roundRevision;
+      const assignmentRevision = context?.expectedAssignmentRevision ?? assignment?.revision;
       // Deliberately camelCase: this is the shape the client reads for recovery on both surfaces.
       sendJson(response, 200, {
         sessionId: session.id,
-        roundNumber: assignment?.roundNumber ?? 0,
-        leftTeam: assignment?.leftTeamName ?? '',
-        rightTeam: assignment?.rightTeamName ?? '',
+        roundNumber: context?.expectedRoundNumber ?? assignment?.roundNumber ?? 0,
+        leftTeam: context?.expectedLeftTeamName ?? assignment?.leftTeamName ?? '',
+        rightTeam: context?.expectedRightTeamName ?? assignment?.rightTeamName ?? '',
         finalReceived: session.finalReceived,
+        status: sessionStatus(session),
+        ...(roundRevision !== undefined ? { roundRevision } : {}),
+        ...(assignmentRevision !== undefined ? { assignmentRevision } : {}),
         latestQbj: session.progressMatch ?? null,
+        rosterAmendments: session.rosterAmendments ?? [],
       });
       return;
     }
@@ -970,6 +1253,15 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
+    if (sessionStatus(session) !== 'open') {
+      sendJson(response, 409, {
+        error:
+          sessionStatus(session) === 'abandoned'
+            ? 'This scoring session has been abandoned.'
+            : 'This game’s result has already been received.',
+      });
+      return;
+    }
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
     if (!isPlainObject(body) || body.take_over !== true) {
@@ -1012,13 +1304,18 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (writerRefused(session, grant, response)) return;
-    if (session.finalReceived) {
+    if (sessionStatus(session) !== 'open') {
       // The recovery state of a game this application has already accepted must not keep moving.
       // Whatever this snapshot says, it describes a game that is over.
-      sendJson(response, 409, { error: 'This game’s result has already been received.' });
+      sendJson(response, 409, {
+        error:
+          sessionStatus(session) === 'abandoned'
+            ? 'This scoring session has been abandoned.'
+            : 'This game’s result has already been received.',
+      });
       return;
     }
+    if (writerRefused(session, grant, response)) return;
 
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
@@ -1037,9 +1334,17 @@ export default class QbtcpServer {
     // A snapshot that names a game is checked against this session's game. It is not required to
     // name one - a match in progress may not carry its identity yet - but a snapshot that names the
     // wrong one would replace this session's recovery state with another game's.
-    const snapshotError = this.snapshotIdentityError(body.match, session);
-    if (snapshotError) {
-      sendJson(response, 409, { error: snapshotError });
+    const snapshotWarning = this.snapshotIdentityWarning(body.match, session);
+    if (snapshotWarning) {
+      sendJson(response, 200, {
+        accepted: false,
+        received: true,
+        // Preserve the legacy warning signal for clients that surface `review_required` on a
+        // nonfatal progress response. This does not create a durable result review item.
+        review_required: true,
+        warning_codes: [snapshotWarning.code],
+        warnings: [snapshotWarning],
+      });
       return;
     }
 
@@ -1060,14 +1365,14 @@ export default class QbtcpServer {
    * identity is the ordinary case for a game a scoresheet is still filling in; one that carries a
    * different game's identity is never a snapshot of this game.
    */
-  private snapshotIdentityError(match: Record<string, unknown>, session: ISession): string | undefined {
+  private snapshotIdentityWarning(match: Record<string, unknown>, session: ISession): IResultDiscrepancy | undefined {
     const identity = readResultIdentity(match);
     if (!identity) return undefined;
     if (identity.matchId && identity.matchId !== session.matchId) {
-      return 'That snapshot does not belong to this scoring session.';
+      return { code: 'match-id-mismatch', message: discrepancyMessage('match-id-mismatch') };
     }
     if (this.belongsToAnotherTournament(identity.tournamentId)) {
-      return 'That snapshot belongs to a different tournament.';
+      return { code: 'tournament-id-mismatch', message: discrepancyMessage('tournament-id-mismatch') };
     }
     return undefined;
   }
@@ -1075,9 +1380,9 @@ export default class QbtcpServer {
   /**
    * Receive the completed game.
    *
-   * The ordering here is the durability contract described at the top of this file. Note that a
-   * conflicting result is still persisted before it is refused: retaining both copies is what lets a
-   * director resolve the disagreement, and discarding the loser would destroy the evidence.
+   * The ordering here is the durability contract described at the top of this file. A conflicting,
+   * mismatched, or unreadable-but-parseable result is persisted before a durable receipt is returned:
+   * retaining both copies is what lets a director resolve the disagreement.
    */
   private async handleResult(
     session: ISession,
@@ -1085,126 +1390,151 @@ export default class QbtcpServer {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (writerRefused(session, grant, response)) return;
+    const abandoned = sessionStatus(session) === 'abandoned';
+    // An abandoned session has no writer authority. A previously issued session capability is still
+    // enough to submit a late final for quarantine/review, but no late progress or takeover can mutate
+    // the abandoned recovery snapshot.
+    if (abandoned) {
+      if (!session.lateResultGrantToken || grant.token !== session.lateResultGrantToken) {
+        sendJson(response, 409, {
+          error: 'This abandoned session no longer accepts results from this capability.',
+        });
+        return;
+      }
+    } else if (writerRefused(session, grant, response)) return;
 
-    const body = await this.readJsonBody(request, response);
+    const body = await this.readResultBody(request, response);
     if (body === undefined) return;
-    if (!isPlainObject(body)) {
-      sendJson(response, 400, { error: 'That result was not a readable QBJ document.' });
-      return;
-    }
 
     const identity = readResultIdentity(body);
-    if (!identity) {
-      sendJson(response, 400, { error: 'That result contained no match this server could read.' });
-      return;
-    }
-    if (identity.tournamentId && identity.tournamentId !== this.state.tournamentId) {
-      sendJson(response, 409, { error: 'That result belongs to a different tournament.' });
-      return;
-    }
+    const fingerprint = identity?.fingerprint ?? resultFingerprintForUnknownDocument(body);
+    const context = this.resultContextForSession(session);
+    const warnings = resultDiscrepancies(body, context, this.expectedDocumentForSession(session));
+    if (abandoned) addServerDiscrepancy(warnings, 'late-after-abandon');
 
-    if (!identity.matchId || identity.matchId !== session.matchId) {
-      sendJson(response, 409, { error: 'That result does not belong to this scoring session.' });
-      return;
-    }
-
-    const comparison = compareToRecorded(
-      { matchId: identity.matchId, fingerprint: identity.fingerprint },
-      this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
-    );
+    // Match ID is authoritative whenever it exists. Only an absent id may use the fingerprint
+    // fallback, so two separate Match IDs with identical statistics remain separate received games.
+    const comparison: ResultComparison =
+      identity?.tournamentId && this.belongsToAnotherTournament(identity.tournamentId)
+        ? { kind: 'new' }
+        : compareToRecorded(
+            { matchId: identity?.matchId, fingerprint },
+            this.state.results.map((r) => ({
+              id: r.id,
+              matchId: r.matchId,
+              fingerprint: r.fingerprint,
+              status: r.status,
+              receivedAt: r.receivedAt,
+              supersededByResultId: r.supersededByResultId,
+            })),
+          );
 
     if (comparison.kind === 'duplicate') {
-      // Idempotence outlives the assignment. A scoresheet may retry after a timeout only after the
-      // director has released this room to its next game; the exact stored result still receives the
-      // same successful acknowledgement instead of becoming a spurious superseded-game error.
-      session.finalReceived = true;
-      session.updatedAt = new Date().toISOString();
-      await this.store.save(this.state);
-      sendJson(response, 200, {
-        accepted: true,
-        match_id: identity.matchId,
-        fingerprint: identity.fingerprint,
-        duplicate: true,
-      });
+      const existing = this.state.results.find((result) => result.id === comparison.existingId);
+      const reviewRequired =
+        warnings.length > 0 || existing?.status === 'needs-review' || existing?.status === 'conflict';
+      if (!abandoned) {
+        session.status = 'final-received';
+        session.finalReceived = true;
+        session.updatedAt = new Date().toISOString();
+        this.pruneResolvedSessionAssignment(session.id);
+        await this.store.save(this.state);
+      }
+      sendJson(
+        response,
+        200,
+        receiptBody({
+          accepted: !reviewRequired,
+          received: true,
+          review_required: reviewRequired,
+          duplicate: true,
+          match_id: identity?.matchId ?? context.expectedMatchId,
+          fingerprint,
+          warning_codes: warnings.map((warning) => warning.code),
+          ...(warnings.length > 0 ? { warnings } : {}),
+        }),
+      );
       this.hooks.onStateChanged();
       return;
     }
 
-    const assignment = this.state.assignments.find((entry) => entry.roomId === session.roomId);
-    if (!assignment || assignment.matchId !== session.matchId) {
-      sendJson(response, 410, { error: 'A newer assignment has superseded this game.' });
-      return;
+    if (comparison.kind === 'conflict') {
+      addServerDiscrepancy(warnings, 'same-match-different-result');
     }
 
-    const assignmentError = resultAssignmentValidation(body, assignment);
-    if (assignmentError) {
-      sendJson(response, assignmentError.status, { error: assignmentError.error });
-      return;
-    }
-
+    const claimedMatchId = identity?.matchId;
+    const retainedDocument = retainResultDocument(body);
+    const resultRoundNumber = identity?.roundNumber ?? context.expectedRoundNumber;
     const received: IReceivedResult = {
       id: makeOpaqueId('res-', 8),
       roomId: session.roomId,
       sessionId: session.id,
-      matchId: identity.matchId,
-      fingerprint: identity.fingerprint,
+      // Keep the expected id as the storage anchor when the document omitted one. The original
+      // claim, including its absence, is kept separately for reconciliation and display.
+      matchId: claimedMatchId ?? context.expectedMatchId,
+      fingerprint,
       status: comparison.kind === 'conflict' ? 'conflict' : 'needs-review',
-      // Kept exactly as it arrived, minus anything credential-shaped that should never have been in
-      // it. This is the evidence the director falls back to.
-      document: stripCredentialKeys(body) as object,
+      document: retainedDocument,
       receivedAt: new Date().toISOString(),
+      ...(claimedMatchId ? { claimedMatchId } : {}),
+      expectedMatchId: context.expectedMatchId,
+      context,
+      warnings,
+      ...(identity ? {} : { unreadable: true }),
+      ...(identity?.assignmentRevision !== undefined ? { claimedAssignmentRevision: identity.assignmentRevision } : {}),
+      ...(identity?.roundRevision !== undefined ? { claimedRoundRevision: identity.roundRevision } : {}),
       ...(comparison.kind === 'conflict' ? { conflictsWithResultId: comparison.existingId } : {}),
-      // A bare QBSheet Match may not carry a round number. The current assignment is authoritative
-      // once the session and match identity have been checked, so keep enough context to reopen the
-      // review after a restart.
-      ...(identity.roundNumber !== undefined
-        ? { roundNumber: identity.roundNumber }
-        : { roundNumber: assignment.roundNumber }),
+      ...(resultRoundNumber !== undefined ? { roundNumber: resultRoundNumber } : {}),
     };
     this.state.results.push(received);
-    session.finalReceived = true;
+    if (!abandoned) {
+      session.status = 'final-received';
+      session.finalReceived = true;
+    }
     session.updatedAt = new Date().toISOString();
 
-    // Durable before anything is acknowledged. A crash after this point loses nothing.
+    // This save is the receipt boundary. Content discrepancies, conflicts, and unreadable parsed
+    // documents all reach this point; only auth, bounds, JSON syntax, and actual storage failures do not.
     await this.store.save(this.state);
 
-    if (comparison.kind === 'conflict') {
-      this.hooks.onResultReceived(received);
-      sendJson(response, 409, {
-        error: 'A different result is already recorded for this game. Tournament control must resolve it.',
-        match_id: received.matchId,
-        fingerprint: received.fingerprint,
+    sendJson(
+      response,
+      200,
+      receiptBody({
+        // `received` is the durable receipt boundary. Keep the legacy `accepted` field true for any
+        // authenticated, parseable body that reached storage; newer clients use `review_required`
+        // to distinguish a retained discrepancy from a canonical import.
+        accepted: true,
+        received: true,
+        review_required: warnings.length > 0 || comparison.kind === 'conflict',
         duplicate: false,
-      });
-      return;
-    }
+        match_id: claimedMatchId ?? context.expectedMatchId,
+        fingerprint,
+        warning_codes: warnings.map((warning) => warning.code),
+        ...(warnings.length > 0 ? { warnings } : {}),
+      }),
+    );
 
-    sendJson(response, 200, {
-      accepted: true,
-      match_id: received.matchId,
-      fingerprint: received.fingerprint,
-      duplicate: false,
-    });
-
-    // Told after the acknowledgement: the renderer failing to hear costs a refresh, and the result is
-    // already safe on disk either way.
+    // The renderer may fail to hear this notification, but the state is already safe on disk and can
+    // be re-offered by its existing unresolved-results command after a restart.
     this.hooks.onResultReceived(received);
   }
 
   // --- presence -------------------------------------------------------------------------------
 
   private async handlePresencePost(room: IRoom, request: IncomingMessage, response: ServerResponse): Promise<void> {
-    // Read and discard the body: presence carries nothing this server needs beyond the headers, but
-    // the stream still has to be consumed and bounded.
     const body = await this.readJsonBody(request, response);
     if (body === undefined) return;
 
+    const details = normalizePresenceDetails(body);
     const entry = {
       roomId: room.id,
       lastSeenAt: new Date().toISOString(),
       ...(headerValue(request, deviceIdHeader) ? { deviceId: headerValue(request, deviceIdHeader) } : {}),
       ...(headerValue(request, operatorNameHeader) ? { operatorName: headerValue(request, operatorNameHeader) } : {}),
+      ...(details.client ? { client: details.client } : {}),
+      ...(details.procedureVersions ? { procedureVersions: details.procedureVersions } : {}),
+      ...(details.qbjVersion ? { qbjVersion: details.qbjVersion } : {}),
     };
     this.state.presence = this.state.presence.filter((p) => p.roomId !== room.id);
     this.state.presence.push(entry);
@@ -1320,10 +1650,16 @@ export default class QbtcpServer {
       sendJson(response, 400, { error: 'A roster update needs a session, team, and player.' });
       return;
     }
-    const sessionId = stringField(body.sessionId, 256);
-    const teamName = stringField(body.teamName, 512);
-    const playerName = stringField(body.playerName, 200);
-    if (!sessionId || !teamName || !playerName) {
+    const sessionId = stringField(body.session_id ?? body.sessionId, 256);
+    const requestedTeamId = stringField(body.team_id ?? body.teamId, 256);
+    const requestedTeamName = stringField(body.team_name ?? body.teamName, 512);
+    const playerName = stringField(body.player_name ?? body.playerName, 200);
+    const rawQuestionNumber = body.question_number ?? body.questionNumber;
+    const questionNumber =
+      typeof rawQuestionNumber === 'number' && Number.isInteger(rawQuestionNumber) && rawQuestionNumber >= 1
+        ? Math.min(rawQuestionNumber, 10000)
+        : undefined;
+    if (!sessionId || (!requestedTeamId && !requestedTeamName) || !playerName) {
       sendJson(response, 400, { error: 'A roster update needs a session, team, and player.' });
       return;
     }
@@ -1335,13 +1671,25 @@ export default class QbtcpServer {
       return;
     }
     const assignment = this.state.assignments.find((entry) => entry.roomId === room.id);
-    if (!assignment || assignment.matchId !== session.matchId || session.finalReceived) {
+    if (!assignment || assignment.matchId !== session.matchId || sessionStatus(session) !== 'open') {
       sendJson(response, 410, { error: 'A newer assignment has superseded this game.' });
       return;
     }
     let teamId: string | undefined;
-    if (teamName === assignment.leftTeamName) teamId = assignment.leftTeamId;
-    if (teamName === assignment.rightTeamName) teamId = assignment.rightTeamId;
+    let teamName: string | undefined;
+    if (requestedTeamId === assignment.leftTeamId) {
+      teamId = assignment.leftTeamId;
+      teamName = assignment.leftTeamName;
+    } else if (requestedTeamId === assignment.rightTeamId) {
+      teamId = assignment.rightTeamId;
+      teamName = assignment.rightTeamName;
+    } else if (!requestedTeamId && requestedTeamName === assignment.leftTeamName) {
+      teamId = assignment.leftTeamId;
+      teamName = assignment.leftTeamName;
+    } else if (!requestedTeamId && requestedTeamName === assignment.rightTeamName) {
+      teamId = assignment.rightTeamId;
+      teamName = assignment.rightTeamName;
+    }
     if (!teamId) {
       sendJson(response, 409, { error: 'That team is not part of this scoring session.' });
       return;
@@ -1351,6 +1699,8 @@ export default class QbtcpServer {
       return;
     }
 
+    if (writerRefused(session, authorized.grant, response)) return;
+
     let outcome: QbtcpRosterPlayerOutcome;
     try {
       outcome = await this.hooks.onRosterPlayerRequested({
@@ -1358,8 +1708,9 @@ export default class QbtcpServer {
         roomId: room.id,
         sessionId,
         teamId,
-        teamName,
+        teamName: teamName as string,
         playerName,
+        ...(questionNumber !== undefined ? { questionNumber } : {}),
       });
     } catch {
       outcome = { ok: false, status: 503, error: 'YellowFruit could not apply that roster update.' };
@@ -1368,7 +1719,44 @@ export default class QbtcpServer {
       sendJson(response, outcome.status ?? 409, { error: outcome.error });
       return;
     }
-    sendJson(response, 200, { added: true, teamName, playerName });
+    const canonicalTeamName = outcome.teamName ?? teamName;
+    const canonicalPlayerName = outcome.playerName ?? playerName;
+    const amendment: IQbtcpRosterAmendment = {
+      teamId,
+      teamName: canonicalTeamName as string,
+      playerName: canonicalPlayerName,
+      ...(questionNumber !== undefined ? { questionNumber } : {}),
+      ...(outcome.playerId ? { playerId: outcome.playerId } : {}),
+      ...(outcome.created !== undefined ? { created: outcome.created } : {}),
+      ...(outcome.warning ? { warning: outcome.warning.slice(0, 200) } : {}),
+      recordedAt: new Date().toISOString(),
+    };
+    const previousAmendments = session.rosterAmendments ?? [];
+    if (
+      !previousAmendments.some(
+        (entry) =>
+          entry.teamId === amendment.teamId &&
+          ((entry.playerId && amendment.playerId && entry.playerId === amendment.playerId) ||
+            entry.playerName.toLocaleLowerCase() === amendment.playerName.toLocaleLowerCase()),
+      )
+    ) {
+      session.rosterAmendments = [...previousAmendments, amendment];
+      session.updatedAt = amendment.recordedAt as string;
+      await this.store.save(this.state);
+    }
+    if (!outcome.playerId && !outcome.teamId && !outcome.teamName && !outcome.playerName) {
+      // Preserve the exact old success shape for servers/renderers that do not yet provide canonical
+      // identity. The durable amendment still gives a newer recovering client the names it needs.
+      sendJson(response, 200, { added: true, teamName: canonicalTeamName, playerName: canonicalPlayerName });
+      return;
+    }
+    sendJson(response, 200, {
+      added: true,
+      player: { id: outcome.playerId ?? null, name: canonicalPlayerName },
+      team: { id: outcome.teamId ?? teamId, name: canonicalTeamName },
+      ...(outcome.created !== undefined ? { created: outcome.created } : {}),
+      ...(outcome.warning ? { warning: outcome.warning } : {}),
+    });
   }
 
   // --- helpers --------------------------------------------------------------------------------
@@ -1394,6 +1782,134 @@ export default class QbtcpServer {
     }
     return parsed.value ?? {};
   }
+
+  /** The result route keeps parsed JSON that is not a useful Match as a reviewable quarantine record. */
+  // eslint-disable-next-line class-methods-use-this -- kept beside the ordinary body reader for one boundary.
+  private async readResultBody(request: IncomingMessage, response: ServerResponse): Promise<unknown | undefined> {
+    const body = await readBody(request);
+    if (!body.ok) {
+      if (body.tooLarge) sendJson(response, 413, { error: 'That request was too large.' });
+      else sendJson(response, 400, { error: 'That request did not arrive completely.' });
+      return undefined;
+    }
+    const parsed = parseUntrustedJson(body.text);
+    if (!parsed.ok) {
+      // Invalid JSON is still a transport failure. It is intentionally not copied verbatim because a
+      // malformed body cannot be passed through the credential-stripping boundary safely.
+      sendJson(response, 400, { error: parsed.error });
+      return undefined;
+    }
+    return parsed.value;
+  }
+
+  private resultContextForSession(session: ISession): IResultReceiptContext {
+    if (session.assignmentContext) return session.assignmentContext;
+    const assignment = this.state.assignments.find(
+      (entry) => entry.roomId === session.roomId && entry.matchId === session.matchId,
+    );
+    const room = this.state.rooms.find((entry) => entry.id === session.roomId);
+    if (assignment && room) return this.assignmentContextForSession(room, assignment, session.id);
+    return {
+      tournamentId: this.state.tournamentId,
+      roomId: session.roomId,
+      roomName: room?.name ?? '',
+      sessionId: session.id,
+      expectedMatchId: session.matchId,
+    };
+  }
+
+  private expectedDocumentForSession(session: ISession): object | undefined {
+    if (session.assignmentDocument) return session.assignmentDocument;
+    return this.state.assignments.find((entry) => entry.roomId === session.roomId && entry.matchId === session.matchId)
+      ?.document;
+  }
+
+  /**
+   * Drop the duplicate assignment snapshot once its session is terminal and no result from it is
+   * still waiting for a director. The immutable assignment context remains for recovery/audit, and
+   * unresolved results retain their own exact document; this only removes the second copy of a QBJ
+   * after it has stopped being needed for comparison.
+   */
+  private pruneResolvedSessionAssignment(sessionId: string): void {
+    const session = this.state.sessions.find((entry) => entry.id === sessionId);
+    if (!session || sessionStatus(session) === 'open') return;
+    if (
+      this.state.results.some(
+        (result) =>
+          result.sessionId === sessionId && (result.status === 'needs-review' || result.status === 'conflict'),
+      )
+    ) {
+      return;
+    }
+    delete session.assignmentDocument;
+  }
+}
+
+function sessionStatus(session: ISession): QbtcpSessionStatus {
+  if (session.status === 'abandoned') return 'abandoned';
+  if (session.status === 'final-received' || session.finalReceived) return 'final-received';
+  return 'open';
+}
+
+function normalizeAbandonReason(reason?: string): string | undefined {
+  if (reason === undefined) return undefined;
+  const normalized = reason.trim();
+  return normalized === '' || normalized.length > 1000 ? undefined : normalized;
+}
+
+function isResultReviewDecision(value: unknown): value is ResultReviewDecision {
+  return value === 'accept' || value === 'keep-existing' || value === 'dismiss' || value === 'supersede';
+}
+
+function normalizeReviewReason(reason?: string): string | undefined {
+  if (reason === undefined) return undefined;
+  const normalized = reason.trim();
+  return normalized === '' || normalized.length > 1000 ? undefined : normalized;
+}
+
+function resolveResultWarnings(result: IReceivedResult, resolution: 'accepted' | 'dismissed'): void {
+  if (!result.warnings) return;
+  for (const warning of result.warnings) {
+    if (!warning.resolution || warning.resolution === 'unresolved') warning.resolution = resolution;
+  }
+}
+
+function addServerDiscrepancy(warnings: IResultDiscrepancy[], code: IResultDiscrepancy['code']): void {
+  if (warnings.some((warning) => warning.code === code)) return;
+  warnings.push({ code, message: discrepancyMessage(code) });
+}
+
+function resultFingerprintForUnknownDocument(document: unknown): string {
+  return resultFingerprint(document);
+}
+
+function retainResultDocument(document: unknown): object {
+  const sanitized = stripCredentialKeys(document);
+  if (isPlainObject(sanitized)) return sanitized;
+  return { _qbtcp_unreadable: sanitized };
+}
+
+/** Add the server-side assignment revision without mutating the renderer's document object. */
+function addAssignmentRevision(document: object, assignmentRevision: number): object {
+  try {
+    const copy = JSON.parse(JSON.stringify(document)) as Record<string, unknown>;
+    const objects = Array.isArray(copy.objects) ? copy.objects : [];
+    const match = objects.find(
+      (entry): entry is Record<string, unknown> => isPlainObject(entry) && entry.type === 'Match',
+    );
+    if (!match) return document;
+    const extension = isPlainObject(match._qbtcp) ? match._qbtcp : {};
+    match._qbtcp = { ...extension, assignment_revision: assignmentRevision };
+    return copy;
+  } catch {
+    // A document from the renderer is expected to be JSON-shaped. If a test or a future caller gives
+    // us an object JSON cannot clone, preserve the original rather than making assignment itself fail.
+    return document;
+  }
+}
+
+function receiptBody(body: object): object {
+  return body;
 }
 
 /** The capability this session has already issued to a non-writer identity, or a fresh one. */
@@ -1472,22 +1988,46 @@ function resultAssignmentValidation(
   }
 
   const extension = match._qbtcp;
-  let revision: unknown;
+  let assignmentRevision: unknown;
+  let roundRevision: unknown;
   if (extension !== undefined) {
     if (!isPlainObject(extension)) {
       return { status: 400, error: 'That result contains invalid QBTCP assignment metadata.' };
     }
-    revision = extension.round_revision ?? extension.roundRevision;
+    assignmentRevision = extension.assignment_revision ?? extension.assignmentRevision;
+    roundRevision = extension.round_revision ?? extension.roundRevision;
   }
-  if (revision === undefined) revision = readResultSourceMetadata(match).roundRevision;
-  if (revision !== undefined && (typeof revision !== 'number' || !Number.isInteger(revision))) {
+  const source = readResultSourceMetadata(match);
+  if (assignmentRevision === undefined) assignmentRevision = source.assignmentRevision;
+  if (roundRevision === undefined) roundRevision = source.roundRevision;
+  // Before the two revisions were split, `round_revision` was the only revision a result carried
+  // and it described the room assignment. Preserve that meaning for old result files and state
+  // records; new documents carry both fields and therefore take the independent paths below.
+  if (assignmentRevision === undefined && roundRevision !== undefined) {
+    assignmentRevision = roundRevision;
+    roundRevision = undefined;
+  }
+  if (
+    assignmentRevision !== undefined &&
+    (typeof assignmentRevision !== 'number' || !Number.isInteger(assignmentRevision))
+  ) {
     return { status: 400, error: 'That result contains invalid QBTCP assignment metadata.' };
   }
-  if (typeof revision === 'number' && revision < assignment.revision) {
+  if (roundRevision !== undefined && (typeof roundRevision !== 'number' || !Number.isInteger(roundRevision))) {
+    return { status: 400, error: 'That result contains invalid QBTCP assignment metadata.' };
+  }
+  if (typeof assignmentRevision === 'number' && assignmentRevision < assignment.revision) {
     return { status: 410, error: 'A newer assignment has superseded this game.' };
   }
-  if (typeof revision === 'number' && revision > assignment.revision) {
+  if (typeof assignmentRevision === 'number' && assignmentRevision > assignment.revision) {
     return { status: 409, error: 'That result does not match this room’s current assignment.' };
+  }
+  const expectedRoundRevision = assignment.roundRevision ?? 1;
+  if (typeof roundRevision === 'number' && roundRevision < expectedRoundRevision) {
+    return { status: 410, error: 'A newer round assignment has superseded this game.' };
+  }
+  if (typeof roundRevision === 'number' && roundRevision > expectedRoundRevision) {
+    return { status: 409, error: 'That result does not match this room’s current round assignment.' };
   }
   return undefined;
 }
@@ -1566,6 +2106,36 @@ function isRecent(timestamp?: string): boolean {
   if (!timestamp) return false;
   const parsed = Date.parse(timestamp);
   return Number.isFinite(parsed) && Date.now() - parsed < presenceFreshMs;
+}
+
+/** Keep presence diagnostics bounded and advisory; none of these fields grants authority. */
+function normalizePresenceDetails(value: unknown): {
+  client?: { name?: string; version?: string; build?: string; commit?: string };
+  procedureVersions?: number[];
+  qbjVersion?: string;
+} {
+  if (!isPlainObject(value)) return {};
+  const rawClient = isPlainObject(value.client) ? value.client : undefined;
+  const client = rawClient
+    ? (Object.fromEntries(
+        (['name', 'version', 'build', 'commit'] as const).flatMap((key) => {
+          const entry = stringField(rawClient[key], 100);
+          return entry ? [[key, entry]] : [];
+        }),
+      ) as { name?: string; version?: string; build?: string; commit?: string })
+    : undefined;
+  const rawVersions = value.procedure_versions ?? value.procedureVersions ?? value.supportedProcedureVersions;
+  const procedureVersions = Array.isArray(rawVersions)
+    ? rawVersions
+        .filter((entry): entry is number => typeof entry === 'number' && Number.isInteger(entry) && entry >= 1)
+        .slice(0, 16)
+    : [];
+  const reportedQbjVersion = stringField(value.qbj_version ?? value.qbjVersion, 50);
+  return {
+    ...(client && Object.keys(client).length > 0 ? { client } : {}),
+    ...(procedureVersions.length > 0 ? { procedureVersions } : {}),
+    ...(reportedQbjVersion ? { qbjVersion: reportedQbjVersion } : {}),
+  };
 }
 
 /** Turn a listen failure into something a director can act on. Never includes a credential. */

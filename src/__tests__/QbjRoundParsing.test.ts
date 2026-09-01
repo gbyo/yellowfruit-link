@@ -8,7 +8,8 @@
 import { expect, test } from 'vitest';
 import FileParser, { roundNumberFromName } from '../renderer/DataModel/FileParsing';
 import { IIndeterminateQbj } from '../renderer/DataModel/Interfaces';
-import { makeTestTournament } from './QbtcpFixtures';
+import { ScheduledGame } from '../renderer/DataModel/ScheduledGame';
+import { makeTestTournament, roundNumbered, teamNamed } from './QbtcpFixtures';
 
 function parserFor() {
   const tournament = makeTestTournament();
@@ -146,4 +147,33 @@ test('an unplayed scheduled game is not given a regulation tossup count', () => 
     ],
   } as unknown as IIndeterminateQbj);
   expect(played?.tossupsRead).toBe(tournament.scoringRules.regulationTossupCount);
+});
+
+test('a bare QBSheet result uses source metadata to fulfil its scheduled game', () => {
+  const { parser, tournament } = importParserFor();
+  const round = roundNumbered(tournament, 4);
+  const leftTeam = teamNamed(tournament, 'Ninety Six');
+  const rightTeam = teamNamed(tournament, 'Greenwood');
+  const scheduledGame = new ScheduledGame(leftTeam, rightTeam, { id: 'SchedGame_qbsheet-result' });
+  round.addScheduledGame(scheduledGame, { bumpRevision: false });
+
+  const parsed = parser.parseMatch({
+    type: 'Match',
+    matchTeams: [
+      {
+        team: { $ref: leftTeam.id },
+        points: 35,
+        matchPlayers: [{ player: { $ref: leftTeam.players[0].id }, tossupsHeard: 1, answerCounts: [] }],
+      },
+      {
+        team: { $ref: rightTeam.id },
+        points: 0,
+        matchPlayers: [{ player: { $ref: rightTeam.players[0].id }, tossupsHeard: 1, answerCounts: [] }],
+      },
+    ],
+    tossupsRead: 1,
+    _qbsheet_source: { scheduledMatchId: scheduledGame.id },
+  } as unknown as IIndeterminateQbj);
+
+  expect(parsed?.scheduledGameId).toBe(scheduledGame.id);
 });

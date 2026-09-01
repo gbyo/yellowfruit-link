@@ -45,7 +45,7 @@ test('a QBSheet roster request immediately adds the player needed by the incomin
   expect(team.players).toHaveLength(originalCount + 1);
 });
 
-test('a roster request cannot mutate a different or renamed team', async () => {
+test('a roster request cannot mutate a team with an unknown stable ID', async () => {
   const team = teamNamed(manager.tournament, 'Ninety Six');
   const originalNames = team.players.map((player) => player.name);
 
@@ -53,11 +53,29 @@ test('a roster request cannot mutate a different or renamed team', async () => {
     requestId: 'roster-wrong-team',
     roomId: 'room-1',
     sessionId: 'session-1',
-    teamId: team.id,
+    teamId: 'Team_not-in-this-tournament',
     teamName: 'Greenwood',
     playerName: 'Should Not Exist',
   });
 
   expect(team.players.map((player) => player.name)).toEqual(originalNames);
   expect(manager.unsavedData).toBe(false);
+});
+
+test('a stable team ID wins when the scorekeeper sends a stale team name', async () => {
+  const team = teamNamed(manager.tournament, 'Ninety Six');
+  const originalCount = team.players.length;
+
+  await manager.handleQbtcpRosterPlayerRequest({
+    requestId: 'roster-renamed-team',
+    roomId: 'room-1',
+    sessionId: 'session-1',
+    teamId: team.id,
+    teamName: 'The old team name',
+    playerName: 'Recovered Player',
+  });
+
+  expect(team.players.map((player) => player.name)).toContain('Recovered Player');
+  expect(team.players).toHaveLength(originalCount + 1);
+  expect(manager.unsavedData).toBe(true);
 });

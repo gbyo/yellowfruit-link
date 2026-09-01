@@ -122,6 +122,7 @@ export interface IResultSourceMetadata {
   scheduledMatchId?: unknown;
   tournamentId?: unknown;
   roundRevision?: unknown;
+  assignmentRevision?: unknown;
 }
 
 /**
@@ -145,6 +146,9 @@ export function readResultSourceMetadata(match: Record<string, unknown>): IResul
     }
     if (metadata.roundRevision === undefined) {
       metadata.roundRevision = source.roundRevision ?? source.round_revision;
+    }
+    if (metadata.assignmentRevision === undefined) {
+      metadata.assignmentRevision = source.assignmentRevision ?? source.assignment_revision;
     }
   }
   return metadata;
@@ -187,8 +191,7 @@ export function findResultMatchList(document: unknown): Record<string, unknown>[
     // top-level objects. Those are the same games, and a file whose games are spelled that way is
     // still a file whose games must not be imported twice.
     for (const entry of objects) {
-      const rounds =
-        entry.type === 'Round' ? [entry] : arrayOf(entry.phases).flatMap((phase) => arrayOf(phase.rounds));
+      const rounds = entry.type === 'Round' ? [entry] : arrayOf(entry.phases).flatMap((phase) => arrayOf(phase.rounds));
       for (const round of rounds) {
         for (const match of arrayOf(round.matches)) {
           if (typeof match.$ref === 'string') continue;
@@ -214,6 +217,7 @@ export interface IResultIdentity {
   fingerprint: string;
   roundNumber?: number;
   roundRevision?: number;
+  assignmentRevision?: number;
 }
 
 function positiveIntegerFrom(value: unknown): number | undefined {
@@ -294,8 +298,36 @@ function identityForMatch(document: unknown, match: Record<string, unknown>): IR
   if (!identity.tournamentId && typeof source.tournamentId === 'string' && source.tournamentId !== '') {
     identity.tournamentId = source.tournamentId;
   }
-  if (typeof source.roundRevision === 'number' && Number.isInteger(source.roundRevision)) {
+  const extension = isPlainObject(match._qbtcp) ? match._qbtcp : undefined;
+  const declaredRoundRevision = extension?.round_revision ?? extension?.roundRevision;
+  const declaredAssignmentRevision = extension?.assignment_revision ?? extension?.assignmentRevision;
+  if (
+    identity.roundRevision === undefined &&
+    typeof declaredRoundRevision === 'number' &&
+    Number.isInteger(declaredRoundRevision)
+  ) {
+    identity.roundRevision = declaredRoundRevision;
+  }
+  if (
+    identity.assignmentRevision === undefined &&
+    typeof declaredAssignmentRevision === 'number' &&
+    Number.isInteger(declaredAssignmentRevision)
+  ) {
+    identity.assignmentRevision = declaredAssignmentRevision;
+  }
+  if (
+    identity.roundRevision === undefined &&
+    typeof source.roundRevision === 'number' &&
+    Number.isInteger(source.roundRevision)
+  ) {
     identity.roundRevision = source.roundRevision;
+  }
+  if (
+    identity.assignmentRevision === undefined &&
+    typeof source.assignmentRevision === 'number' &&
+    Number.isInteger(source.assignmentRevision)
+  ) {
+    identity.assignmentRevision = source.assignmentRevision;
   }
   // A bare Match from MODAQ and older workflows carries its round in `_round`.
   if (identity.roundNumber === undefined) {
@@ -315,15 +347,18 @@ interface IRecordedResult {
   id: string;
   matchId: string;
   fingerprint: string;
+  status?: 'needs-review' | 'accepted' | 'duplicate' | 'conflict' | 'dismissed' | 'superseded';
+  receivedAt?: string;
+  supersededByResultId?: string;
 }
 
 /**
  * Compare an arriving result against those already recorded for this tournament.
  *
- * The implemented matching order is fingerprint first, followed by `Match.id` when the arriving
- * result has one. A same-fingerprint arrival is the correct answer to a retry, while a different
- * fingerprint with the same match identity is never resolved automatically. This comment describes
- * the existing check order; it does not prescribe a different matching policy.
+ * The implemented matching order is stable `Match.id` first, followed by a fingerprint-only fallback
+ * only when the arriving result has no usable id. A different id is a different game even when its
+ * statistics happen to hash identically. A different fingerprint with the same match identity is a
+ * conflict that a person must review.
  *
  * The tournament half of the identity is the caller's concern: this function is only ever given the
  * results recorded for one tournament, so identical `Match.id` values in different tournaments
@@ -333,14 +368,45 @@ export function compareToRecorded(
   arriving: { matchId?: string; fingerprint: string },
   recorded: IRecordedResult[],
 ): ResultComparison {
-  // Same statistics under a different identity is still the same game arriving twice - this is the
-  // manual copy of a result whose identity the scorekeeper's file did not preserve.
+  const matchId = typeof arriving.matchId === 'string' && arriving.matchId.trim() !== '' ? arriving.matchId : undefined;
+  if (matchId) {
+    // A superseded receipt is audit history, not a current candidate. Prefer the newest live result
+    // for this Match ID, with the timestamp when present and array order as the legacy fallback.
+    const candidates = recorded
+      .map((entry, index) => ({ entry, index }))
+      .filter(
+        ({ entry }) =>
+          entry.matchId === matchId &&
+          entry.status !== 'superseded' &&
+          entry.supersededByResultId === undefined &&
+          (entry.status === undefined ||
+            entry.status === 'needs-review' ||
+            entry.status === 'conflict' ||
+            entry.status === 'accepted' ||
+            entry.status === 'duplicate'),
+      )
+      .sort((left, right) => {
+        const leftAt = left.entry.receivedAt ? Date.parse(left.entry.receivedAt) : NaN;
+        const rightAt = right.entry.receivedAt ? Date.parse(right.entry.receivedAt) : NaN;
+        if (Number.isFinite(leftAt) && Number.isFinite(rightAt) && leftAt !== rightAt) return rightAt - leftAt;
+        if (Number.isFinite(leftAt) !== Number.isFinite(rightAt)) return Number.isFinite(rightAt) ? 1 : -1;
+        return right.index - left.index;
+      })
+      .map(({ entry }) => entry);
+    // A correction can leave more than one historical result for one Match ID. Find an exact retry
+    // before selecting the older conflicting copy, otherwise retrying the correction would create a
+    // third review item instead of acknowledging the durable correction evidence.
+    const sameResult = candidates.find(
+      (entry) => entry.matchId === matchId && entry.fingerprint === arriving.fingerprint,
+    );
+    if (sameResult) return { kind: 'duplicate', existingId: sameResult.id };
+    const sameGame = candidates[0];
+    return sameGame ? { kind: 'conflict', existingId: sameGame.id } : { kind: 'new' };
+  }
+
+  // A document without a stable identity can only use its statistics as a conservative fallback.
+  // The caller records a missing-id discrepancy so this ambiguous match is visible to a director.
   const sameStats = recorded.find((entry) => entry.fingerprint === arriving.fingerprint);
   if (sameStats) return { kind: 'duplicate', existingId: sameStats.id };
-
-  if (arriving.matchId) {
-    const sameGame = recorded.find((entry) => entry.matchId === arriving.matchId);
-    if (sameGame) return { kind: 'conflict', existingId: sameGame.id };
-  }
   return { kind: 'new' };
 }

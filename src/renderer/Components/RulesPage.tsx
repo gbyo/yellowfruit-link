@@ -9,6 +9,7 @@ import MaxPlayersSettingsCard from './MaxPlayerSettingsCard';
 import OvertimeSettingsCard from './OvertimeSettingsCard';
 import RoundLengthSettingsCard from './RoundLengthSettingsCard';
 import LightningRoundSettingsCard from './LightningRoundSettingsCard';
+import RoomProcedureSettingsCard from './RoomProcedureSettingsCard';
 import { TournamentContext } from '../TournamentManager';
 import useSubscription from '../Utils/CustomHooks';
 
@@ -21,12 +22,16 @@ function RulesPage() {
       {readOnly && (
         <Grid xs={12}>
           <Alert variant="filled" severity="info" icon={<Lock fontSize="small" />}>
-            Settings are read-only
+            Scoring settings are read-only after a game is entered. Room procedure defaults remain editable for future
+            assignments.
           </Alert>
         </Grid>
       )}
       <Grid xs={12}>
         <StandardRuleSetCard />
+      </Grid>
+      <Grid xs={12}>
+        <RoomProcedureSettingsCard />
       </Grid>
       <Grid xs={12} sm={4}>
         <Stack spacing={2}>

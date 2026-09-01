@@ -23,6 +23,14 @@ import { IQbjRanking, OverallRanking, Ranking } from './Ranking';
 import Registration, { IQbjRegistration } from './Registration';
 import { Round } from './Round';
 import { CommonRuleSets, IQbjScoringRules, ScoringRules } from './ScoringRules';
+import {
+  defaultRoomProcedure,
+  IRoomProcedure,
+  normalizeHandoffInstruction,
+  normalizeRoomProcedure,
+  resolveHandoffInstruction,
+  resolveRoomProcedure,
+} from './RoomProcedure';
 import StandardSchedule from './StandardSchedule';
 import { AggregateStandings, PhaseStandings } from './StatSummaries';
 import { Team } from './Team';
@@ -93,6 +101,8 @@ interface ITournamentExtraData {
   trackDiv2: boolean;
   finalRankingsReady?: boolean;
   usingScheduleTemplate?: boolean;
+  roomProcedure?: IRoomProcedure;
+  handoffInstruction?: string;
 }
 
 /** YellowFruit implementation of the Tournament object */
@@ -157,6 +167,12 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
   /** Opaque permanent identity for this tournament. Empty until one is generated. See ITournamentExtraData. */
   tournamentId: string = '';
 
+  /** The room procedure used by assignments unless a round supplies an override. */
+  roomProcedure: IRoomProcedure = defaultRoomProcedure();
+
+  /** Optional instructions shown to a scorekeeper when this tournament changes rooms or staff. */
+  handoffInstruction?: string;
+
   /** Hook used by TournamentManager's existing dirty-state mechanism. */
   // eslint-disable-next-line class-methods-use-this
   onTournamentIdCreated: () => void = () => {};
@@ -218,6 +234,8 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
       trackDiv2: this.trackDiv2,
       finalRankingsReady: this.finalRankingsReady,
       usingScheduleTemplate: this.usingScheduleTemplate,
+      roomProcedure: normalizeRoomProcedure(this.roomProcedure),
+      handoffInstruction: normalizeHandoffInstruction(this.handoffInstruction),
     };
     const yftFileObj = { YfData: metadata, ...qbjObject };
 
@@ -236,6 +254,24 @@ class Tournament implements IQbjTournament, IYftDataModelObject {
       this.onTournamentIdCreated();
     }
     return this.tournamentId;
+  }
+
+  /** Resolve the procedure snapshot that belongs in an assignment for this round. */
+  roomProcedureForRound(round: Round): IRoomProcedure {
+    return resolveRoomProcedure(this.roomProcedure, round.roomProcedure);
+  }
+
+  /** Resolve the optional handoff instruction that belongs in an assignment for this round. */
+  handoffInstructionForRound(round: Round): string | undefined {
+    return resolveHandoffInstruction(this.handoffInstruction, round.handoffInstruction);
+  }
+
+  setRoomProcedure(procedure: IRoomProcedure): void {
+    this.roomProcedure = normalizeRoomProcedure(procedure);
+  }
+
+  setHandoffInstruction(instruction: string | undefined): void {
+    this.handoffInstruction = normalizeHandoffInstruction(instruction);
   }
 
   compileStats(fullReport: boolean = false, sortByFinalRank: boolean = false) {

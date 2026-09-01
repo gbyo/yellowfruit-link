@@ -112,6 +112,7 @@ test('adding a pairing marks it as the director’s, not the generator’s', () 
   const round = roundNumbered(tournament, 1);
   // Clear the round so there is room to add one without a double booking.
   round.scheduledGames = [];
+  const revisionBefore = round.revision;
   const manager = editorFor(tournament, round);
 
   manager.setTeam('left', teamNamed(tournament, 'Lion'));
@@ -121,6 +122,7 @@ test('adding a pairing marks it as the director’s, not the generator’s', () 
   expect(pairingNames(round)).toEqual(['Lion vs Jaguar']);
   expect(round.scheduledGames[0].generated).toBe(false);
   expect(round.scheduledGames[0].poolName).toBe('Round Robin');
+  expect(round.revision).toBe(revisionBefore + 1);
 });
 
 test('editing a pairing keeps its identity and moves it between rounds', () => {
@@ -130,6 +132,8 @@ test('editing a pairing keeps its identity and moves it between rounds', () => {
   const game = round1.scheduledGames[0];
   const originalId = game.id;
   round2.scheduledGames = []; // make room in the destination
+  const round1RevisionBefore = round1.revision;
+  const round2RevisionBefore = round2.revision;
 
   const manager = editorFor(tournament, round1, 0);
   manager.setRound(round2);
@@ -142,6 +146,8 @@ test('editing a pairing keeps its identity and moves it between rounds', () => {
   expect(round2.scheduledGames[0].id).toBe(originalId);
   // Touched by a person, so automatic regeneration will now leave this pool's schedule alone.
   expect(game.generated).toBe(false);
+  expect(round1.revision).toBe(round1RevisionBefore + 1);
+  expect(round2.revision).toBe(round2RevisionBefore + 1);
 });
 
 test('cancelling the editor changes nothing', () => {

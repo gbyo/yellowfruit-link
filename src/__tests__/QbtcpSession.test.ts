@@ -267,7 +267,7 @@ test('a finished game stops accepting progress and stops being offered as resuma
   expect((await openSession(roomToken, matchId, 'chromebook-1')).body.final_received).toBe(true);
 });
 
-test('a progress snapshot for a different game is refused', async () => {
+test('a progress snapshot for a different game is retained as a nonfatal warning', async () => {
   const { roomToken, matchId } = await pairedRoomWithAssignment();
   const opened = await openSession(roomToken, matchId, 'chromebook-1');
 
@@ -278,7 +278,13 @@ test('a progress snapshot for a different game is refused', async () => {
       match: { id: 'Match_somebody_else', match_teams: [{ team: { $ref: 'a' } }, { team: { $ref: 'b' } }] },
     },
   });
-  expect(wrongGame.status).toBe(409);
+  expect(wrongGame.status).toBe(200);
+  expect(wrongGame.body).toMatchObject({
+    accepted: false,
+    received: true,
+    review_required: true,
+    warning_codes: ['match-id-mismatch'],
+  });
 
   // A snapshot that simply does not say which game it is remains perfectly acceptable.
   const anonymous = await call('PUT', `/sessions/${opened.body.session_id}/progress`, {
@@ -288,7 +294,156 @@ test('a progress snapshot for a different game is refused', async () => {
   expect(anonymous.status).toBe(200);
 });
 
-test('an assignment cannot be replaced or cleared while its result is waiting for review', async () => {
+test('an understandable content mismatch is durably received with typed review warnings', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const opened = await openSession(roomToken, matchId, 'chromebook-1');
+  const received = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: {
+      type: 'Match',
+      id: 'Match_somebody_else',
+      tossups_read: 20,
+      match_teams: [
+        { team: { $ref: 'Team_unknown_left', name: 'Renamed Left' } },
+        { team: { $ref: 'Team_unknown_right', name: 'Renamed Right' } },
+      ],
+      _qbtcp: { version: 1, round_revision: 99 },
+      _qbsheet_source: { tournamentId: 'another-tournament' },
+    },
+  });
+
+  expect(received.status).toBe(200);
+  expect(received.body).toMatchObject({
+    accepted: true,
+    received: true,
+    duplicate: false,
+    review_required: true,
+    match_id: 'Match_somebody_else',
+  });
+  expect(received.body.warning_codes).toEqual(
+    expect.arrayContaining([
+      'match-id-mismatch',
+      'tournament-id-mismatch',
+      'source-tournament-different',
+      'unexpected-assignment-revision',
+      'team-id-mismatch',
+      'team-name-mismatch',
+      'unknown-team',
+    ]),
+  );
+  expect(server.getState().results).toHaveLength(1);
+  expect(server.getState().results[0]).toMatchObject({
+    status: 'needs-review',
+    matchId: 'Match_somebody_else',
+    claimedMatchId: 'Match_somebody_else',
+    expectedMatchId: matchId,
+    context: {
+      expectedMatchId: matchId,
+      expectedRoundNumber: 3,
+      expectedAssignmentRevision: 1,
+    },
+  });
+  expect(server.getState().sessions[0]).toMatchObject({ status: 'final-received', finalReceived: true });
+});
+
+test('a valid JSON result without a usable Match is retained as sanitized unreadable evidence', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const opened = await openSession(roomToken, matchId, 'chromebook-1');
+  const received = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: { token: 'do-not-persist', nested: { sessionToken: 'also-secret' }, note: 'not a QBJ Match' },
+  });
+
+  expect(received.status).toBe(200);
+  expect(received.body).toMatchObject({
+    accepted: true,
+    received: true,
+    review_required: true,
+    duplicate: false,
+    match_id: matchId,
+    warning_codes: ['unreadable-result'],
+  });
+  const stored = server.getState().results[0];
+  expect(stored).toMatchObject({
+    status: 'needs-review',
+    unreadable: true,
+    matchId,
+    expectedMatchId: matchId,
+  });
+  expect(JSON.stringify(stored.document)).not.toContain('do-not-persist');
+  expect(JSON.stringify(stored.document)).not.toContain('also-secret');
+});
+
+test('abandonment preserves progress, releases the room, and quarantines a late final', async () => {
+  const { roomToken, matchId } = await pairedRoomWithAssignment();
+  const roomId = server.getState().rooms[0].id;
+  const opened = await openSession(roomToken, matchId, 'chromebook-1');
+  const secondary = await openSession(roomToken, matchId, 'phone-2');
+  const progress = await call('PUT', `/sessions/${opened.body.session_id}/progress`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: { sequence: 7, match: { tossups_read: 7 } },
+  });
+  expect(progress.status).toBe(200);
+
+  const abandoned = await server.abandonSession(opened.body.session_id, 'Wrong matchup was assigned.');
+  expect(abandoned).toMatchObject({ abandoned: true, progressSequence: 7, hadProgress: true });
+  expect(server.getState().sessions[0]).toMatchObject({
+    status: 'abandoned',
+    finalReceived: false,
+    writerGrantToken: null,
+    writerDeviceId: null,
+    abandonReason: 'Wrong matchup was assigned.',
+    progressSequence: 7,
+  });
+  expect(server.getState().assignments).toEqual([]);
+
+  const reassigned = await server.setAssignment({
+    roomId,
+    roundNumber: 4,
+    leftTeamId: 'Team_left',
+    rightTeamId: 'Team_right',
+    leftTeamName: 'Ninety Six',
+    rightTeamName: 'Greenwood',
+    matchId: 'Match_test02',
+    document: { version: '2.1.1', objects: [] },
+  });
+  expect(reassigned).toMatchObject({ matchId: 'Match_test02' });
+
+  const secondaryLate = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: secondary.body.token },
+    body: { type: 'Match', id: matchId, tossups_read: 7 },
+  });
+  expect(secondaryLate.status).toBe(409);
+
+  const late = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: {
+      type: 'Match',
+      id: matchId,
+      tossups_read: 7,
+      match_teams: [{ team: { $ref: 'Team_left' } }, { team: { $ref: 'Team_right' } }],
+    },
+  });
+  expect(late.status).toBe(200);
+  expect(late.body.warning_codes).toContain('late-after-abandon');
+  expect(server.getState().sessions[0].status).toBe('abandoned');
+  expect(server.getState().sessions[0].progressSequence).toBe(7);
+  expect(server.getState().results[0]).toMatchObject({ status: 'needs-review' });
+
+  const recovery = await call('GET', `/sessions/${opened.body.session_id}/recovery`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+  });
+  expect(recovery.status).toBe(200);
+  expect(recovery.body).toMatchObject({
+    status: 'abandoned',
+    finalReceived: false,
+    roundNumber: 3,
+    leftTeam: 'Ninety Six',
+    rightTeam: 'Greenwood',
+  });
+});
+
+test('a durably received result does not hold up the room’s next assignment', async () => {
   const { roomToken, matchId } = await pairedRoomWithAssignment();
   const roomId = server.getState().rooms[0].id;
   const opened = await openSession(roomToken, matchId, 'chromebook-1');
@@ -301,6 +456,19 @@ test('an assignment cannot be replaced or cleared while its result is waiting fo
     },
   });
 
+  expect(
+    await server.setAssignment({
+      roomId,
+      roundNumber: 3,
+      leftTeamId: 'Team_left',
+      rightTeamId: 'Team_right',
+      leftTeamName: 'Ninety Six',
+      rightTeamName: 'Greenwood',
+      matchId,
+      document: { version: '2.1.1', objects: [] },
+    }),
+  ).toMatchObject({ assigned: false });
+
   const replaced = await server.setAssignment({
     roomId,
     roundNumber: 4,
@@ -311,12 +479,16 @@ test('an assignment cannot be replaced or cleared while its result is waiting fo
     matchId: 'Match_test02',
     document: { version: '2.1.1', objects: [] },
   });
-  expect(replaced).toMatchObject({ assigned: false });
-  expect(await server.clearAssignment(roomId)).toMatchObject({ cleared: false });
+  expect(replaced).toMatchObject({ matchId: 'Match_test02', revision: 2 });
+  expect(await server.clearAssignment(roomId)).toMatchObject({ cleared: true });
 
   const [received] = server.getState().results;
-  await server.resolveResult(received.id, 'accepted');
-  expect(await server.clearAssignment(roomId)).toMatchObject({ cleared: true });
+  expect(received.context).toMatchObject({
+    expectedMatchId: matchId,
+    expectedRoundNumber: 3,
+    roomName: 'Room 1',
+  });
+  expect(server.getState().sessions[0]).toMatchObject({ status: 'final-received', finalReceived: true });
 });
 
 test('an assignment built against a stale revision is refused rather than stored', async () => {
@@ -505,7 +677,7 @@ test('known QBTCP resources return 405 for unsupported methods before authentica
   expect((await call('POST', '/sessions/not-open/recovery')).status).toBe(405);
 });
 
-test('an exact result retry stays idempotent after the room advances, while changed work receives 410', async () => {
+test('an exact result retry stays idempotent after the room advances, while a correction is stored for review', async () => {
   const { roomToken, matchId } = await pairedRoomWithAssignment();
   const roomId = server.getState().rooms[0].id;
   const opened = await openSession(roomToken, matchId, 'chromebook-1');
@@ -554,5 +726,20 @@ test('an exact result retry stays idempotent after the room advances, while chan
     headers: { [sessionTokenHeader]: opened.body.token },
     body: { ...result, tossups_read: 21 },
   });
-  expect(changed.status).toBe(410);
+  expect(changed.status).toBe(200);
+  expect(changed.body).toMatchObject({ accepted: true, received: true, duplicate: false, review_required: true });
+  expect(changed.body.warning_codes).toContain('same-match-different-result');
+  expect(server.getState().results).toHaveLength(2);
+  expect(server.getState().results[1]).toMatchObject({
+    status: 'conflict',
+    conflictsWithResultId: server.getState().results[0].id,
+  });
+
+  const correctionRetry = await call('POST', `/sessions/${opened.body.session_id}/result`, {
+    headers: { [sessionTokenHeader]: opened.body.token },
+    body: { ...result, tossups_read: 21 },
+  });
+  expect(correctionRetry.status).toBe(200);
+  expect(correctionRetry.body.duplicate).toBe(true);
+  expect(server.getState().results).toHaveLength(2);
 });

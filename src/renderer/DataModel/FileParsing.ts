@@ -19,6 +19,7 @@ import { IQbjRank } from './Rank';
 import { IQbjRanking, OverallRanking, Ranking } from './Ranking';
 import Registration, { IQbjRegistration, IYftFileRegistration } from './Registration';
 import { IQbjRound, IYftFileRound, Round, sortRounds } from './Round';
+import { defaultRoomProcedure, normalizeHandoffInstruction, normalizeRoomProcedure } from './RoomProcedure';
 import { IYftFileScheduledGame, ScheduledGame } from './ScheduledGame';
 import { IQbjScoringRules, IYftFileScoringRules, ScoringRules } from './ScoringRules';
 import { IQbjTeam, IYftFileTeam, Team } from './Team';
@@ -27,6 +28,7 @@ import { IQbjTournamentSite, TournamentSite } from './TournamentSite';
 import { QbjTypeNames } from './QbjEnums';
 import { findTournamentObject } from './QbjUtils2';
 import { IQbjPacket, Packet } from './Packet';
+import { readResultSourceMetadata } from '../../qbtcp/ResultFingerprint';
 import {
   IQbjMatchQuestion,
   IQbjMatchQuestionBonus,
@@ -169,6 +171,10 @@ export default class FileParser {
       // Absent in files written before this field existed. Left empty here rather than generated, so
       // that parsing stays free of side effects; the next save assigns one.
       this.tourn.tournamentId = yfExtraData.tournamentId || '';
+      this.tourn.roomProcedure = yfExtraData.roomProcedure
+        ? normalizeRoomProcedure(yfExtraData.roomProcedure)
+        : defaultRoomProcedure();
+      this.tourn.handoffInstruction = normalizeHandoffInstruction(yfExtraData.handoffInstruction);
     } else {
       this.tourn.inferCarryoverStatus();
     }
@@ -708,12 +714,25 @@ export default class FileParser {
     // returning - an early return used to leave every such round empty.
     const isNonNumeric = !Number.isFinite(roundNumber);
     const yftRound = new Round(isNonNumeric ? fallbackRoundNo : roundNumber);
+    if (
+      typeof yfExtraData?.revision === 'number' &&
+      Number.isInteger(yfExtraData.revision) &&
+      yfExtraData.revision >= 1
+    ) {
+      yftRound.revision = yfExtraData.revision;
+    }
     if (isNonNumeric && typeof qbjRound.name === 'string') yftRound.name = qbjRound.name;
 
     const packetFromFile = this.parseRoundPacket(qbjRound);
     if (packetFromFile) yftRound.packet = packetFromFile;
 
     if (typeof yfExtraData?.nonNumericName === 'string') yftRound.name = yfExtraData.nonNumericName;
+    if (yfExtraData?.roomProcedure !== undefined) {
+      yftRound.roomProcedure = normalizeRoomProcedure(yfExtraData.roomProcedure);
+    }
+    if (yfExtraData?.handoffInstruction !== undefined) {
+      yftRound.handoffInstruction = normalizeHandoffInstruction(yfExtraData.handoffInstruction);
+    }
     yftRound.matches = this.parseRoundMatches(qbjRound);
     yftRound.scheduledGames = this.parseScheduledGames(yfExtraData?.scheduledGames);
     return yftRound;
@@ -849,7 +868,13 @@ export default class FileParser {
     yfMatch.modalBottomValidation = new MatchValidationCollection();
     yfMatch.modalBottomValidation.addFromFileObjects(yfExtraData?.otherValidation || []);
     yfMatch.importedFile = yfExtraData?.importedFile;
-    yfMatch.scheduledGameId = yfExtraData?.scheduledGameId ?? this.scheduledGameIdFromMatchId(qbjMatch.id);
+    const sourceMetadata = readResultSourceMetadata(baseObj as unknown as Record<string, unknown>);
+    const sourceScheduledGameId =
+      typeof sourceMetadata.scheduledMatchId === 'string' ? sourceMetadata.scheduledMatchId : undefined;
+    yfMatch.scheduledGameId =
+      yfExtraData?.scheduledGameId ??
+      this.scheduledGameIdFromMatchId(qbjMatch.id) ??
+      this.scheduledGameIdFromMatchId(sourceScheduledGameId);
 
     yfMatch.validateAll(this.tourn.scoringRules);
     yfMatch.determineStatsValidity();
@@ -932,6 +957,11 @@ export default class FileParser {
     if (isQbjRefPointer(qbjTeam)) {
       const importFileTeamObj = this.getYfObjectFromId(qbjTeam, this.teamsById);
       if (!importFileTeamObj) {
+        // A bare QBSheet result carries the stable Team id from its assignment but does not repeat
+        // the assignment's Team objects. Resolve that reference against the open tournament before
+        // falling back to the normal whole-file reference path.
+        const canonicalTeam = this.tourn.findTeamById((qbjTeam as IQbjRefPointer).$ref);
+        if (canonicalTeam) return canonicalTeam;
         throw new Error(`Couldn't resolve reference to team ${(qbjTeam as IQbjRefPointer).$ref}`);
       }
       nameToMatch = importFileTeamObj.name;
@@ -1006,6 +1036,11 @@ export default class FileParser {
     if (isQbjRefPointer(qbjPlayer)) {
       const importFilePlayerObj = this.getYfObjectFromId(qbjPlayer, this.playersById);
       if (!importFilePlayerObj) {
+        // A bare QBSheet result has canonical Player refs but, unlike an official whole QBJ file,
+        // cannot include the Player objects they point to. The team is already known, so an exact
+        // id lookup is safe and avoids degrading a stable identity to a fuzzy name guess.
+        const canonicalPlayer = team.players.find((player) => player.id === (qbjPlayer as IQbjRefPointer).$ref);
+        if (canonicalPlayer) return canonicalPlayer;
         throw new Error(`Couldn't resolve reference to player ${(qbjPlayer as IQbjRefPointer).$ref}`);
       }
       nameToMatch = importFilePlayerObj.name;

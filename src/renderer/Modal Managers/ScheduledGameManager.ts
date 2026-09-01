@@ -116,8 +116,12 @@ export default class ScheduledGameManager {
       originalGame.generated = false;
       originalGame.poolName = ScheduledGameManager.poolNameFor(phase, leftTeam, rightTeam);
       if (originalRound && originalRound !== round) {
-        originalRound.deleteScheduledGame(originalGame);
-        round.addScheduledGame(originalGame);
+        originalRound.deleteScheduledGame(originalGame, { bumpRevision: false });
+        round.addScheduledGame(originalGame, { bumpRevision: false });
+        originalRound.touchScheduledGamesRevision();
+        round.touchScheduledGamesRevision();
+      } else {
+        round.touchScheduledGamesRevision();
       }
       return;
     }

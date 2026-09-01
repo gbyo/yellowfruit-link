@@ -28,7 +28,14 @@ import { Team } from '../DataModel/Team';
 import Tournament from '../DataModel/Tournament';
 
 function emptyStatus(): IQbtcpServerStatus {
-  return { running: false, addresses: [], hasActiveWork: false, rooms: [], scoresheetUrl: defaultScoresheetUrl };
+  return {
+    running: false,
+    addresses: [],
+    hasActiveWork: false,
+    rooms: [],
+    reviewQueue: [],
+    scoresheetUrl: defaultScoresheetUrl,
+  };
 }
 
 function noop(): void {}
@@ -199,6 +206,27 @@ export default class RoomsManager {
     await this.send({ kind: 'clearAssignment', roomId });
   }
 
+  async abandonSession(
+    sessionId: string,
+    reason?: string,
+  ): Promise<{ abandoned: boolean; warning?: string; reason?: string }> {
+    const reply = await this.send({ kind: 'abandonSession', sessionId, reason });
+    if (!reply.ok || !('abandoned' in reply) || !reply.abandoned) {
+      const rejectionReason = reply.ok ? 'The scoring session could not be abandoned.' : reply.error;
+      // Refresh even on rejection: the session may have been resolved by another control-table
+      // action while this request was in flight. Restore the rejection after refresh, because a
+      // successful status poll otherwise clears the only explanation shown by the page.
+      await this.refresh();
+      this.lastError = rejectionReason;
+      this.dataChangedReactCallback();
+      return { abandoned: false, reason: rejectionReason };
+    }
+    // The command response is intentionally small; refresh so the released assignment and terminal
+    // session status are reflected in the Rooms table before the next click.
+    await this.refresh();
+    return { abandoned: true, warning: 'warning' in reply ? reply.warning : undefined };
+  }
+
   async resolveHelpRequest(requestId: string): Promise<void> {
     await this.send({ kind: 'resolveHelpRequest', requestId });
   }
@@ -223,6 +251,13 @@ export default class RoomsManager {
       return `it is assigned to ${room.name}`;
     }
     return undefined;
+  }
+
+  /** Whether a room has been issued this pairing or has retained its final. Used to explain procedure edits. */
+  hasReceivedResultForScheduledGame(scheduledGameId: string): boolean {
+    return this.status.rooms.some(
+      (room) => room.assignment?.matchId === scheduledGameId || room.result?.matchId === scheduledGameId,
+    );
   }
 
   /**
@@ -299,11 +334,11 @@ export default class RoomsManager {
     }
 
     const idToPublish = matchId ?? makeOpaqueId('Match_', 8);
-    // The server increments its own revision; this is the value published in the document for the
-    // assignment about to replace whatever the room had. It is sent along with the command so the
-    // server can refuse a command issued from a page that had already gone out of date, rather than
-    // storing a revision the document it is storing does not claim.
-    const roundRevision = (room.assignment?.revision ?? 0) + 1;
+    // The round revision describes the pairing set; the assignment revision describes this room's
+    // delivery of one game. They must not be conflated: reassigning a room does not rebracket the
+    // round, and rebracketing must be visible even when the room happens to keep its assignment.
+    const roundRevision = round.revision;
+    const assignmentRevision = (room.assignment?.revision ?? 0) + 1;
     const document = buildAssignmentDocument({
       tournament,
       phase,
@@ -314,6 +349,7 @@ export default class RoomsManager {
       roomName: room.name,
       roomId: room.id,
       roundRevision,
+      assignmentRevision,
     });
 
     await this.send({
@@ -327,6 +363,7 @@ export default class RoomsManager {
       matchId: idToPublish,
       document,
       roundRevision,
+      assignmentRevision,
     });
   }
 

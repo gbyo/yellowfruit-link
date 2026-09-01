@@ -181,7 +181,13 @@ test('a pairing whose result is awaiting review stays where it is', () => {
   const rooms = managerFor(tournament, [
     roomView('room-1', 'Room 1', {
       assignment: assignmentView(underReview.id, 1),
-      result: { id: 'result-1', status: 'needs-review', fingerprint: 'abc', receivedAt: '2026-08-19T12:00:00Z' },
+      result: {
+        id: 'result-1',
+        matchId: underReview.id,
+        status: 'needs-review',
+        fingerprint: 'abc',
+        receivedAt: '2026-08-19T12:00:00Z',
+      },
     }),
     roomView('room-2', 'Room 2'),
   ]);
@@ -192,10 +198,43 @@ test('a pairing whose result is awaiting review stays where it is', () => {
   const conflicted = managerFor(tournament, [
     roomView('room-1', 'Room 1', {
       assignment: assignmentView(underReview.id, 1),
-      result: { id: 'result-1', status: 'conflict', fingerprint: 'abc', receivedAt: '2026-08-19T12:00:00Z' },
+      result: {
+        id: 'result-1',
+        matchId: underReview.id,
+        status: 'conflict',
+        fingerprint: 'abc',
+        receivedAt: '2026-08-19T12:00:00Z',
+      },
     }),
   ]);
   expect(conflicted.scheduledGameBusyReason(underReview.id, 'room-2')).toContain('waiting for review');
+});
+
+test('procedure warnings include live assignments before a final and retained results after release', () => {
+  const tournament = makeTemplateTournament(Sched4TeamsQuadRR);
+  const round = roundNumbered(tournament, 1);
+  const [issued] = round.scheduledGames;
+
+  const live = managerFor(tournament, [
+    roomView('room-1', 'Room 1', {
+      assignment: assignmentView(issued.id, 1),
+      session: { id: 'session-1', scoring: true, finalReceived: false },
+    }),
+  ]);
+  expect(live.hasReceivedResultForScheduledGame(issued.id)).toBe(true);
+
+  const retained = managerFor(tournament, [
+    roomView('room-1', 'Room 1', {
+      result: {
+        id: 'result-1',
+        matchId: issued.id,
+        status: 'accepted',
+        fingerprint: 'abc',
+        receivedAt: '2026-08-19T12:00:00Z',
+      },
+    }),
+  ]);
+  expect(retained.hasReceivedResultForScheduledGame(issued.id)).toBe(true);
 });
 
 test('the earliest round with an available game comes first', () => {

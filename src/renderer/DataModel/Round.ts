@@ -6,6 +6,7 @@ import { IQbjPacket, Packet } from './Packet';
 import { Phase } from './Phase';
 import { Player } from './Player';
 import { QbjTypeNames } from './QbjEnums';
+import { IRoomProcedure, normalizeHandoffInstruction, normalizeRoomProcedure } from './RoomProcedure';
 import { IYftFileScheduledGame, ScheduledGame } from './ScheduledGame';
 import { Team } from './Team';
 
@@ -31,6 +32,8 @@ export interface IYftFileRound extends IQbjRound, IYftFileObject {
 /** Additional info not in qbj but needed for a .yft file */
 export interface IRoundExtraData {
   number: number;
+  /** Which issue of this round's pairings is current. Old files default to the first issue. */
+  revision?: number;
   nonNumericName?: string;
   /**
    * Pairings for this round that have not been played.
@@ -41,12 +44,19 @@ export interface IRoundExtraData {
    * emitting it as one would make a QBJ-only export claim a day of nil-nil games was played.
    */
   scheduledGames?: IYftFileScheduledGame[];
+  /** Optional room-procedure replacement for this round. Omit to inherit tournament defaults. */
+  roomProcedure?: IRoomProcedure;
+  /** Optional handoff instruction replacement for this round. Omit to inherit tournament defaults. */
+  handoffInstruction?: string;
 }
 
 /** One round of games */
 export class Round implements IQbjRound, IYftDataModelObject {
   /** Number for ordering. For normal rounds, an interger. For tiebreakers/finals, might not be */
   number: number;
+
+  /** Round-pairing revision, independent from a room's assignment revision. */
+  revision: number = 1;
 
   private _name?: string;
 
@@ -75,6 +85,12 @@ export class Round implements IQbjRound, IYftDataModelObject {
    */
   scheduledGames: ScheduledGame[] = [];
 
+  /** Optional room-procedure replacement for this round. */
+  roomProcedure?: IRoomProcedure;
+
+  /** Optional handoff instruction replacement for this round. */
+  handoffInstruction?: string;
+
   get id(): string {
     return `Round_${this.name}`;
   }
@@ -101,8 +117,11 @@ export class Round implements IQbjRound, IYftDataModelObject {
 
     const yfData: IRoundExtraData = {
       number: this.number,
+      revision: this.revision,
       nonNumericName: this._name,
       scheduledGames: this.scheduledGames.length > 0 ? this.scheduledGames.map((sg) => sg.toFileObject()) : undefined,
+      roomProcedure: this.roomProcedure ? normalizeRoomProcedure(this.roomProcedure) : undefined,
+      handoffInstruction: normalizeHandoffInstruction(this.handoffInstruction),
     };
     const yftFileObj = { YfData: yfData, ...qbjObject };
 
@@ -131,12 +150,21 @@ export class Round implements IQbjRound, IYftDataModelObject {
     return this.scheduledGames.length > 0;
   }
 
-  addScheduledGame(game: ScheduledGame) {
-    this.scheduledGames.push(game);
+  /** Advance the persisted issue of this round's schedule after a real schedule mutation. */
+  touchScheduledGamesRevision() {
+    this.revision = Math.max(1, this.revision ?? 1) + 1;
   }
 
-  deleteScheduledGame(game: ScheduledGame) {
-    this.scheduledGames = this.scheduledGames.filter((sg) => sg !== game);
+  addScheduledGame(game: ScheduledGame, options: { bumpRevision?: boolean } = {}) {
+    this.scheduledGames.push(game);
+    if (options.bumpRevision !== false) this.touchScheduledGamesRevision();
+  }
+
+  deleteScheduledGame(game: ScheduledGame, options: { bumpRevision?: boolean } = {}) {
+    const next = this.scheduledGames.filter((sg) => sg !== game);
+    if (next.length === this.scheduledGames.length) return;
+    this.scheduledGames = next;
+    if (options.bumpRevision !== false) this.touchScheduledGamesRevision();
   }
 
   findScheduledGameById(id: string) {
@@ -178,7 +206,17 @@ export class Round implements IQbjRound, IYftDataModelObject {
 
   /** Drop scheduled games that name a team the tournament no longer has. */
   removeScheduledGamesWithTeam(team: Team) {
-    this.scheduledGames = this.scheduledGames.filter((sg) => !sg.includesTeam(team));
+    const next = this.scheduledGames.filter((sg) => !sg.includesTeam(team));
+    if (next.length === this.scheduledGames.length) return;
+    this.scheduledGames = next;
+    this.touchScheduledGamesRevision();
+  }
+
+  /** Clear this round's unplayed schedule and record the new issue when something was removed. */
+  clearScheduledGames() {
+    if (this.scheduledGames.length === 0) return;
+    this.scheduledGames = [];
+    this.touchScheduledGamesRevision();
   }
 
   getPlayersWithData(team: Team) {

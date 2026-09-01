@@ -4,7 +4,13 @@ import path from 'path';
 import { expect, test } from 'vitest';
 import QbtcpServer, { validateResultAgainstAssignment } from '../main/qbtcp/QbtcpServer';
 import QbtcpStore from '../main/qbtcp/QbtcpStore';
-import { findResultMatchList, readResultIdentity, readResultSourceMetadata } from '../qbtcp/ResultFingerprint';
+import {
+  compareToRecorded,
+  findResultMatchList,
+  readResultIdentity,
+  readResultSourceMetadata,
+} from '../qbtcp/ResultFingerprint';
+import { resultDiscrepancies } from '../qbtcp/ResultDiscrepancy';
 import { IRoomAssignment } from '../qbtcp/QbtcpState';
 import { buildAssignmentDocument } from '../renderer/DataModel/QbjAssignment';
 import { makeTestTournament, roundNumbered, teamNamed } from './QbtcpFixtures';
@@ -98,9 +104,147 @@ test('prefers standard QBJ identity and team IDs when they are present', () => {
   };
   const match = result.objects.find((entry) => entry.type === 'Match');
   if (!match) throw new Error('fixture has no Match');
+  match._qbtcp = { round_revision: 2, assignment_revision: 3 };
+  match._qbsheet_source = { roundRevision: 9, assignmentRevision: 9 };
 
-  expect(readResultIdentity(result)).toMatchObject({ matchId: assignment.matchId });
-  expect(validateResultAgainstAssignment(result, assignment)).toBeUndefined();
+  expect(readResultIdentity(result)).toMatchObject({
+    matchId: assignment.matchId,
+    roundRevision: 2,
+    assignmentRevision: 3,
+  });
+});
+
+test('compares referenced team and player objects from the received document without roster-subset warnings', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const context = {
+    tournamentId,
+    roomId: assignment.roomId,
+    roomName: 'Room 204',
+    sessionId: 'session-1',
+    expectedMatchId: assignment.matchId,
+    expectedRoundNumber: assignment.roundNumber,
+    expectedAssignmentRevision: assignment.revision,
+    expectedRoundRevision: assignment.roundRevision,
+    expectedLeftTeamId: assignment.leftTeamId,
+    expectedRightTeamId: assignment.rightTeamId,
+    expectedLeftTeamName: assignment.leftTeamName,
+    expectedRightTeamName: assignment.rightTeamName,
+  };
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const leftTeam = received.objects.find((entry) => entry.type === 'Team' && entry.id === assignment.leftTeamId);
+  const leftPlayer = leftTeam?.players?.[0] as Record<string, unknown> | undefined;
+  if (!leftTeam || !leftPlayer) throw new Error('fixture has no referenced team/player');
+
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  const matchTeams = match?.match_teams as { team: { $ref: string }; match_players?: unknown[] }[] | undefined;
+  if (!matchTeams?.[0] || typeof leftPlayer.id !== 'string') throw new Error('fixture match has no left team');
+  matchTeams[0].match_players = [{ player: { $ref: leftPlayer.id } }];
+  leftTeam.name = 'Ninety Six Renamed';
+  leftPlayer.name = 'Sarah Renamed';
+  const codes = resultDiscrepancies(received, context, assignment.document).map((warning) => warning.code);
+
+  expect(codes).toContain('team-name-mismatch');
+  expect(codes).toContain('player-name-mismatch');
+  expect(codes).not.toContain('unknown-player');
+  expect(codes).not.toContain('roster-different');
+});
+
+test('recognizes reversed referenced teams without misclassifying either team as unknown', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  if (!match) throw new Error('fixture has no Match');
+  const matchTeams = match.match_teams as unknown[];
+  match.match_teams = matchTeams.slice().reverse();
+
+  const codes = resultDiscrepancies(
+    received,
+    {
+      tournamentId,
+      roomId: assignment.roomId,
+      roomName: 'Room 204',
+      sessionId: 'session-1',
+      expectedMatchId: assignment.matchId,
+      expectedRoundNumber: assignment.roundNumber,
+      expectedAssignmentRevision: assignment.revision,
+      expectedRoundRevision: assignment.roundRevision,
+      expectedLeftTeamId: assignment.leftTeamId,
+      expectedRightTeamId: assignment.rightTeamId,
+      expectedLeftTeamName: assignment.leftTeamName,
+      expectedRightTeamName: assignment.rightTeamName,
+    },
+    assignment.document,
+  ).map((warning) => warning.code);
+
+  expect(codes).toContain('team-order-different');
+  expect(codes).not.toContain('team-id-mismatch');
+  expect(codes).not.toContain('team-name-mismatch');
+  expect(codes).not.toContain('unknown-team');
+});
+
+test('classifies a known player name with a different id, and a genuinely unknown player, independently', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const context = {
+    tournamentId,
+    roomId: assignment.roomId,
+    roomName: 'Room 204',
+    sessionId: 'session-1',
+    expectedMatchId: assignment.matchId,
+    expectedRoundNumber: assignment.roundNumber,
+    expectedAssignmentRevision: assignment.revision,
+    expectedRoundRevision: assignment.roundRevision,
+    expectedLeftTeamId: assignment.leftTeamId,
+    expectedRightTeamId: assignment.rightTeamId,
+    expectedLeftTeamName: assignment.leftTeamName,
+    expectedRightTeamName: assignment.rightTeamName,
+  };
+
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  const leftTeam = received.objects.find((entry) => entry.type === 'Team' && entry.id === assignment.leftTeamId);
+  const expectedPlayer = leftTeam?.players?.[0] as Record<string, unknown> | undefined;
+  if (!match || !leftTeam || !expectedPlayer) throw new Error('fixture has no match/team/player');
+
+  const receivedTeams = match.match_teams as { team: { $ref: string }; match_players?: unknown[] }[];
+  const leftMatchTeam = receivedTeams[0];
+  if (!leftMatchTeam) throw new Error('fixture match has no left team');
+  leftMatchTeam.match_players = [{ player: { $ref: 'Player_reassigned' } }, { player: { $ref: 'Player_unknown' } }];
+  received.objects.push(
+    { type: 'Player', id: 'Player_reassigned', name: expectedPlayer.name },
+    { type: 'Player', id: 'Player_unknown', name: 'Unknown Player' },
+  );
+
+  const codes = resultDiscrepancies(received, context, assignment.document).map((warning) => warning.code);
+  expect(codes).toContain('player-id-mismatch');
+  expect(codes).toContain('unknown-player');
+});
+
+test('does not call a foreign source tournament different when the expected id is unavailable', () => {
+  const { assignment } = buildFixture();
+  const received = JSON.parse(JSON.stringify(assignment.document)) as { objects: Record<string, unknown>[] };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  if (!match) throw new Error('fixture has no Match');
+  match._qbsheet_source = { tournamentId: 'foreign-tournament' };
+
+  const warnings = resultDiscrepancies(
+    received,
+    {
+      tournamentId: '',
+      roomId: assignment.roomId,
+      roomName: 'Room 204',
+      sessionId: 'session-1',
+      expectedMatchId: assignment.matchId,
+    },
+    assignment.document,
+  );
+
+  expect(warnings.map((warning) => warning.code)).not.toContain('source-tournament-different');
 });
 
 test('finds inline matches under top-level Round objects', () => {
@@ -135,6 +279,40 @@ test('deduplicates distinct Match objects that carry the same stable identity', 
   };
 
   expect(findResultMatchList(document)).toEqual([first]);
+});
+
+test('deduplicates by Match ID before fingerprint and recognizes retries of a correction', () => {
+  const recorded = [
+    {
+      id: 'result-original',
+      matchId: 'Match_one',
+      fingerprint: 'score-a',
+      status: 'superseded' as const,
+      supersededByResultId: 'result-correction',
+      receivedAt: '2026-08-19T12:00:00.000Z',
+    },
+    {
+      id: 'result-correction',
+      matchId: 'Match_one',
+      fingerprint: 'score-b',
+      status: 'accepted' as const,
+      receivedAt: '2026-08-19T12:01:00.000Z',
+    },
+  ];
+
+  expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-a' }, recorded)).toEqual({
+    kind: 'conflict',
+    existingId: 'result-correction',
+  });
+  expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-b' }, recorded)).toEqual({
+    kind: 'duplicate',
+    existingId: 'result-correction',
+  });
+  expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-c' }, recorded)).toEqual({
+    kind: 'conflict',
+    existingId: 'result-correction',
+  });
+  expect(compareToRecorded({ matchId: 'Match_two', fingerprint: 'score-a' }, recorded)).toEqual({ kind: 'new' });
 });
 
 test('a multi-game file is classified and recorded one game at a time', async () => {
@@ -296,6 +474,153 @@ test("a game from another tournament is not mistaken for this tournament's", asy
     const foreign = { ...bareGame('some-other-tournament'), tossups_read: 24 };
     expect(server.classifyResults(foreign)).toEqual([{ kind: 'new' }]);
     await expect(server.recordFileResult(foreign)).rejects.toThrow('different tournament');
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('an explicit result review keeps both sides of a supersession in durable state', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-review-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('review-tournament');
+
+    server.getState().results.push(
+      {
+        id: 'result-original',
+        roomId: 'room-1',
+        sessionId: 'session-1',
+        matchId: 'Match_one',
+        fingerprint: 'score-a',
+        status: 'accepted',
+        document: { type: 'Match', id: 'Match_one', tossups_read: 20 },
+        receivedAt: '2026-08-19T12:00:00.000Z',
+      },
+      {
+        id: 'result-correction',
+        roomId: 'room-1',
+        sessionId: 'session-2',
+        matchId: 'Match_one',
+        fingerprint: 'score-b',
+        status: 'conflict',
+        conflictsWithResultId: 'result-original',
+        document: { type: 'Match', id: 'Match_one', tossups_read: 21 },
+        receivedAt: '2026-08-19T12:01:00.000Z',
+      },
+    );
+
+    const reviewed = await server.reviewResult('result-correction', {
+      decision: 'supersede',
+      existingResultId: 'result-original',
+      reason: 'Director confirmed the corrected tossup count.',
+    });
+    expect(reviewed).toEqual({ reviewed: true });
+    expect(server.getState().results).toMatchObject([
+      {
+        id: 'result-original',
+        status: 'superseded',
+        supersededByResultId: 'result-correction',
+      },
+      {
+        id: 'result-correction',
+        status: 'accepted',
+        supersedesResultId: 'result-original',
+        review: {
+          decision: 'supersede',
+          targetResultId: 'result-original',
+          reason: 'Director confirmed the corrected tossup count.',
+        },
+      },
+    ]);
+
+    const reloaded = await new QbtcpStore(directory).load('review-tournament');
+    expect(reloaded.state.results).toMatchObject([
+      { id: 'result-original', status: 'superseded', supersededByResultId: 'result-correction' },
+      { id: 'result-correction', status: 'accepted', supersedesResultId: 'result-original' },
+    ]);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('keep-existing and dismiss are explicit terminal review decisions', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'yellowfruit-qbtcp-review-decisions-'));
+  try {
+    const server = new QbtcpServer(new QbtcpStore(directory), {
+      onResultReceived: () => {},
+      onStateChanged: () => {},
+    });
+    await server.bindTournament('review-decisions-tournament');
+
+    server.getState().results.push(
+      {
+        id: 'result-kept',
+        roomId: 'room-1',
+        sessionId: 'session-1',
+        matchId: 'Match_one',
+        fingerprint: 'score-a',
+        status: 'accepted',
+        document: { type: 'Match', id: 'Match_one', tossups_read: 20 },
+        receivedAt: '2026-08-19T12:00:00.000Z',
+      },
+      {
+        id: 'result-dismissed',
+        roomId: 'room-1',
+        sessionId: 'session-2',
+        matchId: 'Match_one',
+        fingerprint: 'score-b',
+        status: 'conflict',
+        conflictsWithResultId: 'result-kept',
+        document: { type: 'Match', id: 'Match_one', tossups_read: 21 },
+        receivedAt: '2026-08-19T12:01:00.000Z',
+      },
+      {
+        id: 'result-unreadable',
+        roomId: 'room-1',
+        sessionId: 'session-3',
+        matchId: 'Match_two',
+        fingerprint: 'score-c',
+        status: 'needs-review',
+        document: { type: 'Match', id: 'Match_two' },
+        receivedAt: '2026-08-19T12:02:00.000Z',
+      },
+    );
+
+    expect(
+      await server.reviewResult('result-dismissed', {
+        decision: 'keep-existing',
+        existingResultId: 'result-kept',
+        reason: 'The original score sheet is the signed copy.',
+      }),
+    ).toEqual({ reviewed: true });
+    expect(
+      await server.reviewResult('result-unreadable', {
+        decision: 'dismiss',
+        reason: 'The director confirmed this was a duplicate export artifact.',
+      }),
+    ).toEqual({ reviewed: true });
+
+    expect(server.getState().results).toMatchObject([
+      { id: 'result-kept', status: 'accepted' },
+      {
+        id: 'result-dismissed',
+        status: 'dismissed',
+        keepsResultId: 'result-kept',
+        resolution: 'dismissed',
+        review: { decision: 'keep-existing', targetResultId: 'result-kept' },
+      },
+      {
+        id: 'result-unreadable',
+        status: 'dismissed',
+        resolution: 'dismissed',
+        dismissedAt: expect.any(String),
+        review: { decision: 'dismiss' },
+      },
+    ]);
+    expect(server.unresolvedResults().map((result) => result.id)).toEqual([]);
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }

@@ -114,6 +114,26 @@ test('a custom pool generates the same 24-game structure on request', () => {
   expect([...meetingCounts(phase.rounds).values()]).toEqual([4, 4, 4, 4, 4, 4]);
 });
 
+test('generated and regenerated schedules advance each touched round exactly once', () => {
+  const tournament = makeCustomRoundRobinTournament(4, 1, 4);
+  const [phase] = tournament.phases;
+  const before = phase.rounds.map((round) => round.revision);
+
+  const first = tournament.generatePairingsForOnePhase(phase, PairingGenerationMode.ReplaceAll);
+  expect(first.gamesCreated).toBe(6);
+  const touched = phase.rounds.map((round) => round.scheduledGames.length > 0);
+  expect(phase.rounds.map((round) => round.revision)).toEqual(
+    before.map((revision, index) => revision + (touched[index] ? 1 : 0)),
+  );
+
+  const afterFirst = phase.rounds.map((round) => round.revision);
+  const second = tournament.generatePairingsForOnePhase(phase, PairingGenerationMode.ReplaceAll);
+  expect(second.gamesRemoved).toBe(6);
+  expect(phase.rounds.map((round) => round.revision)).toEqual(
+    afterFirst.map((revision, index) => revision + (touched[index] ? 1 : 0)),
+  );
+});
+
 test('parallel pools are generated independently and share round numbers', () => {
   const tournament = makeTwoPoolTournament();
   const [phase] = tournament.phases;

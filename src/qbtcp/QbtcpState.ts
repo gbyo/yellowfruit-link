@@ -15,6 +15,9 @@
  * or the renderer's view of a room. `IRoomView` below is the redacted shape the renderer is given.
  */
 import { QbtcpHelpCategory } from './QbtcpProtocol';
+import type { IResultDiscrepancy, IResultReceiptContext, ResultDiscrepancyResolution } from './ResultDiscrepancy';
+
+export type { IResultDiscrepancy, IResultReceiptContext, ResultDiscrepancyResolution } from './ResultDiscrepancy';
 
 /** A scoring position in the tournament. The unit that pairs and authenticates. */
 export interface IRoom {
@@ -53,6 +56,8 @@ export interface IRoomAssignment {
   matchId: string;
   /** Which issue of this round's pairings. Increases when an assignment is changed. */
   revision: number;
+  /** Which issue of the round pairing this assignment was built from. Older state omitted it. */
+  roundRevision?: number;
   /** The exact QBJ assignment document served for this game. */
   document: object;
   /** Display labels, so the Rooms page needs no lookup into the tournament. */
@@ -73,6 +78,8 @@ export interface ISessionGrant {
   token: string;
 }
 
+export type QbtcpSessionStatus = 'open' | 'final-received' | 'abandoned';
+
 /** The work of one scoresheet on one assigned game. */
 export interface ISession {
   id: string;
@@ -82,14 +89,26 @@ export interface ISession {
   grants: ISessionGrant[];
   /** Capability that currently owns writer authority. Secret; null means the next grant claims it. */
   writerGrantToken: string | null;
+  /** Former writer capability allowed to submit one late final for an abandoned session only. Secret. */
+  lateResultGrantToken?: string;
   /** Informational label for the current writer. Writer authority comes from writerGrantToken. */
   writerDeviceId: string | null;
   /** Highest progress sequence accepted. A lower one is discarded silently. */
   progressSequence: number;
   /** Latest progress snapshot, as the QBJ `Match` the client sent. Best effort. */
   progressMatch?: object;
-  /** Set once a final has been durably persisted for this session. */
+  /** Persisted lifecycle; `finalReceived` remains as a wire/state compatibility field. */
+  status: QbtcpSessionStatus;
+  /** Set once a final has been durably persisted for this session. Kept for old clients. */
   finalReceived: boolean;
+  /** Immutable assignment facts used for recovery and late-result reconciliation. */
+  assignmentContext?: IResultReceiptContext;
+  /** The assignment document snapshot used for comparing late result content, without credentials. */
+  assignmentDocument?: object;
+  /** Append-only canonical roster changes made during this session. */
+  rosterAmendments?: IQbtcpRosterAmendment[];
+  abandonedAt?: string;
+  abandonReason?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,7 +122,32 @@ export type ReceivedResultStatus =
   /** The same statistical result was already on record. No second match was created. */
   | 'duplicate'
   /** Same tournament and match identity, different statistics. A person must resolve it. */
-  | 'conflict';
+  | 'conflict'
+  /** Kept as audit evidence after a director chose another result. */
+  | 'dismissed'
+  /** Kept as audit evidence after a later result replaced it. */
+  | 'superseded';
+
+/** Deliberate director decisions for a received result that needs reconciliation. */
+export type ResultReviewDecision = 'accept' | 'keep-existing' | 'dismiss' | 'supersede';
+
+/** Persisted decision metadata; the received QBJ remains immutable evidence beside it. */
+export interface IResultReview {
+  decision: ResultReviewDecision;
+  resolvedAt: string;
+  reason?: string;
+  /** The result selected as the existing/old side of a review decision. */
+  targetResultId?: string;
+}
+
+/** Input for the explicit director-side result review primitive. */
+export interface IResultReviewRequest {
+  decision: ResultReviewDecision;
+  existingResultId?: string;
+  reason?: string;
+  /** Set by the shared importer after it has committed the incoming QBJ as a Match. */
+  imported?: boolean;
+}
 
 /**
  * A final that reached this server.
@@ -122,10 +166,38 @@ export interface IReceivedResult {
   status: ReceivedResultStatus;
   document: object;
   receivedAt: string;
+  /** Match ID that arrived in the result, when the result claimed one. */
+  claimedMatchId?: string;
+  /** Match ID YellowFruit expected for the authenticated session. */
+  expectedMatchId?: string;
+  /** Immutable context captured when the session was opened. */
+  context?: IResultReceiptContext;
+  /** Typed, safe discrepancies found before import/review. */
+  warnings?: IResultDiscrepancy[];
+  /** True when the retained document did not contain a usable Match. */
+  unreadable?: boolean;
   /** Set when this result conflicts with an earlier one; names the result it disagrees with. */
   conflictsWithResultId?: string;
+  /** Explicit persisted director decision, including keep/dismiss/supersede choices. */
+  review?: IResultReview;
+  /** The earlier result this correction replaces, without deleting that evidence. */
+  supersedesResultId?: string;
+  /** The later result that replaced this one, without deleting this evidence. */
+  supersededByResultId?: string;
+  /** The result retained when this incoming result was dismissed as a correction. */
+  keepsResultId?: string;
+  /** Timestamp for a dismissed incoming result, separate from its receipt timestamp. */
+  dismissedAt?: string;
+  /** Compatibility resolution metadata retained for existing consumers. */
+  resolution?: ResultDiscrepancyResolution;
+  /** The corresponding tournament Match was committed by the importer. */
+  importedMatchId?: string;
   /** Round the result claims, for display before it is imported. */
   roundNumber?: number;
+  /** Assignment revision claimed by the result, when present. */
+  claimedAssignmentRevision?: number;
+  /** Round revision claimed by the result, when present. */
+  claimedRoundRevision?: number;
 }
 
 /** Whether a room device has been heard from lately. Advisory only. */
@@ -134,6 +206,15 @@ export interface IPresence {
   deviceId?: string;
   operatorName?: string;
   lastSeenAt: string;
+  /** Bounded, advisory client diagnostics; never used for authentication. */
+  client?: {
+    name?: string;
+    version?: string;
+    build?: string;
+    commit?: string;
+  };
+  procedureVersions?: number[];
+  qbjVersion?: string;
 }
 
 export type HelpRequestStatus = 'open' | 'cancelled' | 'resolved';
@@ -166,9 +247,32 @@ export interface IQbtcpRosterPlayerRequest {
   teamId: string;
   teamName: string;
   playerName: string;
+  questionNumber?: number;
 }
 
-export type QbtcpRosterPlayerOutcome = { ok: true } | { ok: false; error: string; status?: 409 | 503 };
+export interface IQbtcpRosterAmendment {
+  teamId: string;
+  teamName: string;
+  playerId?: string;
+  playerName: string;
+  created?: boolean;
+  questionNumber?: number;
+  recordedAt?: string;
+  /** Safe, bounded note when control had to reconcile the requested and canonical team identity. */
+  warning?: string;
+}
+
+export type QbtcpRosterPlayerOutcome =
+  | {
+      ok: true;
+      playerId?: string;
+      playerName?: string;
+      teamId?: string;
+      teamName?: string;
+      created?: boolean;
+      warning?: string;
+    }
+  | { ok: false; error: string; status?: 409 | 503 };
 
 /** The whole persisted operational state for one tournament. */
 export interface IQbtcpTournamentState {
@@ -186,7 +290,7 @@ export interface IQbtcpTournamentState {
   helpRequests: IQbtcpHelpRequest[];
 }
 
-export const qbtcpStateVersion = 1;
+export const qbtcpStateVersion = 3;
 
 export function emptyQbtcpState(tournamentId: string): IQbtcpTournamentState {
   return {
@@ -219,6 +323,10 @@ export interface IRoomView {
   connected: boolean;
   lastSeenAt?: string;
   operatorName?: string;
+  /** Safe advisory client metadata from the latest heartbeat; never an authentication input. */
+  client?: IPresence['client'];
+  procedureVersions?: number[];
+  qbjVersion?: string;
   assignment?: {
     id: string;
     roundNumber: number;
@@ -226,22 +334,39 @@ export interface IRoomView {
     rightTeamName: string;
     matchId: string;
     revision: number;
+    roundRevision?: number;
   };
   session?: {
     id: string;
     /** Whether any progress snapshot has arrived. */
     scoring: boolean;
+    status?: QbtcpSessionStatus;
     tossupsRead?: number;
     finalReceived: boolean;
   };
   result?: {
     id: string;
+    matchId: string;
     status: ReceivedResultStatus;
     fingerprint: string;
     receivedAt: string;
+    warningCount?: number;
+    warningCodes?: string[];
   };
   /** Open requests only. Closed history stays in the main process. */
   helpRequests?: IQbtcpHelpRequest[];
+}
+
+/** Redacted global review-queue entry, including results whose room has already moved on. */
+export interface IRoomReviewQueueItem {
+  id: string;
+  roomId: string;
+  roomName: string;
+  matchId: string;
+  roundNumber?: number;
+  status: Extract<ReceivedResultStatus, 'needs-review' | 'conflict'>;
+  receivedAt: string;
+  warningCount?: number;
 }
 
 /** Server status as shown on the Rooms page. */
@@ -257,4 +382,6 @@ export interface IQbtcpServerStatus {
   /** Whether any session is unfinished or any result still needs review, which blocks a tournament switch. */
   hasActiveWork: boolean;
   rooms: IRoomView[];
+  /** Results still needing a director decision, independent of the room's current assignment. */
+  reviewQueue?: IRoomReviewQueueItem[];
 }
