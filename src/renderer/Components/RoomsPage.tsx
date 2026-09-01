@@ -298,6 +298,7 @@ function RoomRow(props: IRoomRowProps) {
                         rooms
                           .abandonSession(room.session!.id, 'Abandoned from Rooms page')
                           .then((outcome) => {
+                            if (outcome.reason) tournManager.makeToast(outcome.reason, 'error');
                             if (outcome.warning) tournManager.makeToast(outcome.warning, 'warning');
                             return undefined;
                           })

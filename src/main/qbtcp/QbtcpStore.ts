@@ -257,12 +257,21 @@ function optionalReference(value: unknown): string | undefined {
   return value.slice(0, 1024);
 }
 
-function rosterAmendments(value: unknown): IQbtcpRosterAmendment[] | null {
-  if (value === undefined) return [];
+interface IListValidation<T> {
+  value: T[];
+  discarded: number;
+}
+
+function rosterAmendments(value: unknown): IListValidation<IQbtcpRosterAmendment> | null {
+  if (value === undefined) return { value: [], discarded: 0 };
   if (!Array.isArray(value)) return null;
   const amendments: IQbtcpRosterAmendment[] = [];
+  let discarded = Math.max(0, value.length - 200);
   for (const entry of value.slice(0, 200)) {
-    if (!isPlainObject(entry)) continue;
+    if (!isPlainObject(entry)) {
+      discarded += 1;
+      continue;
+    }
     const teamId = typeof entry.teamId === 'string' ? entry.teamId.trim().slice(0, 256) : '';
     const teamName = typeof entry.teamName === 'string' ? entry.teamName.trim().slice(0, 512) : '';
     const playerName = typeof entry.playerName === 'string' ? entry.playerName.trim().slice(0, 200) : '';
@@ -270,7 +279,10 @@ function rosterAmendments(value: unknown): IQbtcpRosterAmendment[] | null {
       typeof entry.playerId === 'string' && entry.playerId.trim() !== ''
         ? entry.playerId.trim().slice(0, 256)
         : undefined;
-    if (!teamId || !teamName || !playerName) continue;
+    if (!teamId || !teamName || !playerName) {
+      discarded += 1;
+      continue;
+    }
     const questionNumber =
       typeof entry.questionNumber === 'number' && Number.isInteger(entry.questionNumber) && entry.questionNumber >= 1
         ? entry.questionNumber
@@ -289,7 +301,7 @@ function rosterAmendments(value: unknown): IQbtcpRosterAmendment[] | null {
       ...(warning ? { warning } : {}),
     });
   }
-  return amendments;
+  return { value: amendments, discarded };
 }
 
 function presenceClient(value: unknown): { name?: string; version?: string; build?: string; commit?: string } | null {
@@ -356,17 +368,49 @@ function resultContext(value: unknown): IResultReceiptContext | undefined {
     'expectedRightTeamName',
   ] as const;
   if (optionalStringKeys.some((key) => value[key] !== undefined && typeof value[key] !== 'string')) return undefined;
-  return value as unknown as IResultReceiptContext;
+  const context = {
+    tournamentId: (value.tournamentId as string).slice(0, 256),
+    roomId: (value.roomId as string).slice(0, 256),
+    roomName: (value.roomName as string).slice(0, 512),
+    sessionId: (value.sessionId as string).slice(0, 256),
+    expectedMatchId: (value.expectedMatchId as string).slice(0, 256),
+    ...(typeof value.assignmentId === 'string' ? { assignmentId: value.assignmentId.slice(0, 256) } : {}),
+    ...(typeof value.expectedRoundNumber === 'number' ? { expectedRoundNumber: value.expectedRoundNumber } : {}),
+    ...(typeof value.expectedAssignmentRevision === 'number'
+      ? { expectedAssignmentRevision: value.expectedAssignmentRevision }
+      : {}),
+    ...(typeof value.expectedRoundRevision === 'number' ? { expectedRoundRevision: value.expectedRoundRevision } : {}),
+    ...(typeof value.expectedLeftTeamId === 'string'
+      ? { expectedLeftTeamId: value.expectedLeftTeamId.slice(0, 256) }
+      : {}),
+    ...(typeof value.expectedRightTeamId === 'string'
+      ? { expectedRightTeamId: value.expectedRightTeamId.slice(0, 256) }
+      : {}),
+    ...(typeof value.expectedLeftTeamName === 'string'
+      ? { expectedLeftTeamName: value.expectedLeftTeamName.slice(0, 512) }
+      : {}),
+    ...(typeof value.expectedRightTeamName === 'string'
+      ? { expectedRightTeamName: value.expectedRightTeamName.slice(0, 512) }
+      : {}),
+  };
+  return context;
 }
 
-function resultWarnings(value: unknown): IResultDiscrepancy[] | null {
-  if (value === undefined) return [];
+function resultWarnings(value: unknown): IListValidation<IResultDiscrepancy> | null {
+  if (value === undefined) return { value: [], discarded: 0 };
   if (!Array.isArray(value)) return null;
   const validCodes = new Set<string>(resultDiscrepancyCodes);
   const warnings: IResultDiscrepancy[] = [];
-  for (const entry of value) {
-    if (!isPlainObject(entry) || typeof entry.code !== 'string' || !validCodes.has(entry.code)) continue;
-    if (typeof entry.message !== 'string') continue;
+  let discarded = Math.max(0, value.length - 200);
+  for (const entry of value.slice(0, 200)) {
+    if (!isPlainObject(entry) || typeof entry.code !== 'string' || !validCodes.has(entry.code)) {
+      discarded += 1;
+      continue;
+    }
+    if (typeof entry.message !== 'string') {
+      discarded += 1;
+      continue;
+    }
     const expected = safeWarningValue(entry.expected);
     const received = safeWarningValue(entry.received);
     const code = entry.code as IResultDiscrepancy['code'];
@@ -383,7 +427,7 @@ function resultWarnings(value: unknown): IResultDiscrepancy[] | null {
     };
     warnings.push(warning);
   }
-  return warnings;
+  return { value: warnings, discarded };
 }
 
 function safeWarningValue(value: unknown, depth = 0): IResultDiscrepancy['expected'] | undefined {
@@ -509,6 +553,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     const assignmentContext =
       session.assignmentContext === undefined ? undefined : resultContext(session.assignmentContext);
     const amendments = rosterAmendments(session.rosterAmendments);
+    if (amendments) discarded += amendments.discarded;
     if (
       typeof session.id !== 'string' ||
       typeof session.roomId !== 'string' ||
@@ -560,6 +605,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
     if (status === 'abandoned') writerGrantToken = null;
     const normalizedSession = without(session, 'sessionToken');
     delete normalizedSession.lateResultGrantToken;
+    delete normalizedSession.rosterAmendments;
 
     return [
       {
@@ -576,7 +622,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
         writerDeviceId: status === 'abandoned' ? null : writerGrant?.deviceId ?? null,
         ...(assignmentContext ? { assignmentContext } : {}),
         ...(isPlainObject(session.assignmentDocument) ? { assignmentDocument: session.assignmentDocument } : {}),
-        ...(amendments && amendments.length > 0 ? { rosterAmendments: amendments } : {}),
+        ...(amendments && amendments.value.length > 0 ? { rosterAmendments: amendments.value } : {}),
       },
     ];
   });
@@ -590,6 +636,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
   ]);
   const results = records(parsed.results).flatMap((result) => {
     const warnings = resultWarnings(result.warnings);
+    if (warnings) discarded += warnings.discarded;
     const context = result.context === undefined ? undefined : resultContext(result.context);
     const review = resultReview(result.review);
     if (
@@ -607,6 +654,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
       (result.context !== undefined && context === undefined) ||
       (result.claimedMatchId !== undefined && typeof result.claimedMatchId !== 'string') ||
       (result.expectedMatchId !== undefined && typeof result.expectedMatchId !== 'string') ||
+      (result.importedMatchId !== undefined && typeof result.importedMatchId !== 'string') ||
       (result.unreadable !== undefined && typeof result.unreadable !== 'boolean') ||
       (result.claimedAssignmentRevision !== undefined && !isNonNegativeInteger(result.claimedAssignmentRevision)) ||
       (result.claimedRoundRevision !== undefined && !isNonNegativeInteger(result.claimedRoundRevision)) ||
@@ -634,7 +682,7 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
       {
         ...normalized,
         status: (result.status as ReceivedResultStatus | undefined) ?? 'needs-review',
-        warnings: warnings ?? [],
+        warnings: warnings?.value ?? [],
         ...(context ? { context } : {}),
         ...(review ? { review } : {}),
         ...(optionalReference(result.conflictsWithResultId)
@@ -648,6 +696,9 @@ function validateState(parsed: unknown, tournamentId: string): IValidatedState |
           : {}),
         ...(optionalReference(result.keepsResultId) ? { keepsResultId: optionalReference(result.keepsResultId) } : {}),
         ...(optionalReference(result.dismissedAt) ? { dismissedAt: optionalReference(result.dismissedAt) } : {}),
+        ...(optionalReference(result.importedMatchId)
+          ? { importedMatchId: optionalReference(result.importedMatchId) }
+          : {}),
         ...(typeof result.claimedAssignmentRevision === 'number'
           ? { claimedAssignmentRevision: result.claimedAssignmentRevision }
           : {}),

@@ -526,7 +526,6 @@ function RoundPairings(props: IRoundPairingsProps) {
             <IconButton
               size="small"
               aria-label={`Edit ${round.displayName()} room procedure`}
-              disabled={tournManager.tournament.hasMatchData}
               onClick={() => setProcedureOpen(true)}
             >
               <Tune fontSize="small" />

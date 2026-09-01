@@ -250,6 +250,89 @@ test('warning context is bounded and credential-shaped values are not restored f
   expect(JSON.stringify(loaded.state)).not.toContain('secret');
 });
 
+test('reports discarded roster amendments and warnings, including truncation and invalid entries', async () => {
+  const store = await newStore();
+  const amendments = Array.from({ length: 202 }, (_, index) => ({
+    teamId: 'team-1',
+    teamName: 'Team One',
+    playerName: `Player ${index}`,
+  }));
+  amendments.push(null as unknown as (typeof amendments)[number]);
+  amendments.push({ teamId: 'team-1', teamName: '', playerName: 'Missing team name' });
+  await writeRawState(store, 'discarded-nested', {
+    ...emptyQbtcpState('discarded-nested'),
+    sessions: [
+      {
+        id: 'session-1',
+        roomId: 'room-1',
+        matchId: 'Match_1',
+        sessionToken: 'session-token',
+        rosterAmendments: amendments,
+      },
+    ],
+    results: [
+      {
+        id: 'result-1',
+        roomId: 'room-1',
+        sessionId: 'session-1',
+        matchId: 'Match_1',
+        fingerprint: 'fingerprint-1',
+        status: 'needs-review',
+        document: { type: 'Match', id: 'Match_1' },
+        receivedAt: '2026-01-01T00:00:00.000Z',
+        warnings: [
+          { code: 'match-id-mismatch', message: 'valid' },
+          null,
+          { code: 'not-a-warning', message: 'invalid code' },
+        ],
+      },
+    ],
+  });
+
+  const loaded = await store.load('discarded-nested');
+
+  expect(loaded.state.sessions[0].rosterAmendments).toHaveLength(200);
+  expect(loaded.state.results[0].warnings).toHaveLength(1);
+  expect(loaded.problem).toContain('6 saved Rooms records were damaged');
+});
+
+test('rebuilds and bounds persisted result context while retaining importer identity', async () => {
+  const store = await newStore();
+  await writeRawState(store, 'context-boundary', {
+    ...emptyQbtcpState('context-boundary'),
+    results: [
+      {
+        id: 'result-1',
+        roomId: 'room-1',
+        sessionId: 'session-1',
+        matchId: 'Match_1',
+        importedMatchId: 'Match_1',
+        fingerprint: 'fingerprint-1',
+        status: 'accepted',
+        document: { type: 'Match', id: 'Match_1' },
+        receivedAt: '2026-01-01T00:00:00.000Z',
+        context: {
+          tournamentId: 'context-boundary',
+          roomId: 'room-1',
+          roomName: 'R'.repeat(1000),
+          sessionId: 'session-1',
+          expectedMatchId: 'Match_1',
+          expectedRoundNumber: 4,
+          credentials: { token: 'must not survive' },
+        },
+      },
+    ],
+  });
+
+  const loaded = await store.load('context-boundary');
+  const result = loaded.state.results[0];
+
+  expect(result.importedMatchId).toBe('Match_1');
+  expect(result.context).toMatchObject({ tournamentId: 'context-boundary', expectedRoundNumber: 4 });
+  expect(result.context?.roomName).toHaveLength(512);
+  expect(result.context).not.toHaveProperty('credentials');
+});
+
 test('help requests survive restart and a pre-help state loads with an empty request list', async () => {
   const store = await newStore();
   const state = emptyQbtcpState('help-tournament');

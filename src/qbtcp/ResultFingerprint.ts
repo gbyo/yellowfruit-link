@@ -315,10 +315,18 @@ function identityForMatch(document: unknown, match: Record<string, unknown>): IR
   ) {
     identity.assignmentRevision = declaredAssignmentRevision;
   }
-  if (typeof source.roundRevision === 'number' && Number.isInteger(source.roundRevision)) {
+  if (
+    identity.roundRevision === undefined &&
+    typeof source.roundRevision === 'number' &&
+    Number.isInteger(source.roundRevision)
+  ) {
     identity.roundRevision = source.roundRevision;
   }
-  if (typeof source.assignmentRevision === 'number' && Number.isInteger(source.assignmentRevision)) {
+  if (
+    identity.assignmentRevision === undefined &&
+    typeof source.assignmentRevision === 'number' &&
+    Number.isInteger(source.assignmentRevision)
+  ) {
     identity.assignmentRevision = source.assignmentRevision;
   }
   // A bare Match from MODAQ and older workflows carries its round in `_round`.
@@ -339,6 +347,9 @@ interface IRecordedResult {
   id: string;
   matchId: string;
   fingerprint: string;
+  status?: 'needs-review' | 'accepted' | 'duplicate' | 'conflict' | 'dismissed' | 'superseded';
+  receivedAt?: string;
+  supersededByResultId?: string;
 }
 
 /**
@@ -359,14 +370,37 @@ export function compareToRecorded(
 ): ResultComparison {
   const matchId = typeof arriving.matchId === 'string' && arriving.matchId.trim() !== '' ? arriving.matchId : undefined;
   if (matchId) {
+    // A superseded receipt is audit history, not a current candidate. Prefer the newest live result
+    // for this Match ID, with the timestamp when present and array order as the legacy fallback.
+    const candidates = recorded
+      .map((entry, index) => ({ entry, index }))
+      .filter(
+        ({ entry }) =>
+          entry.matchId === matchId &&
+          entry.status !== 'superseded' &&
+          entry.supersededByResultId === undefined &&
+          (entry.status === undefined ||
+            entry.status === 'needs-review' ||
+            entry.status === 'conflict' ||
+            entry.status === 'accepted' ||
+            entry.status === 'duplicate'),
+      )
+      .sort((left, right) => {
+        const leftAt = left.entry.receivedAt ? Date.parse(left.entry.receivedAt) : NaN;
+        const rightAt = right.entry.receivedAt ? Date.parse(right.entry.receivedAt) : NaN;
+        if (Number.isFinite(leftAt) && Number.isFinite(rightAt) && leftAt !== rightAt) return rightAt - leftAt;
+        if (Number.isFinite(leftAt) !== Number.isFinite(rightAt)) return Number.isFinite(rightAt) ? 1 : -1;
+        return right.index - left.index;
+      })
+      .map(({ entry }) => entry);
     // A correction can leave more than one historical result for one Match ID. Find an exact retry
     // before selecting the older conflicting copy, otherwise retrying the correction would create a
     // third review item instead of acknowledging the durable correction evidence.
-    const sameResult = recorded.find(
+    const sameResult = candidates.find(
       (entry) => entry.matchId === matchId && entry.fingerprint === arriving.fingerprint,
     );
     if (sameResult) return { kind: 'duplicate', existingId: sameResult.id };
-    const sameGame = recorded.find((entry) => entry.matchId === matchId);
+    const sameGame = candidates[0];
     return sameGame ? { kind: 'conflict', existingId: sameGame.id } : { kind: 'new' };
   }
 

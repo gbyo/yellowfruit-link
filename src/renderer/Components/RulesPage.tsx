@@ -22,7 +22,8 @@ function RulesPage() {
       {readOnly && (
         <Grid xs={12}>
           <Alert variant="filled" severity="info" icon={<Lock fontSize="small" />}>
-            Settings are read-only
+            Scoring settings are read-only after a game is entered. Room procedure defaults remain editable for future
+            assignments.
           </Alert>
         </Grid>
       )}

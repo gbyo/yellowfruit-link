@@ -118,7 +118,13 @@ test('deleting a team whose result is waiting for review is refused, and says so
   manager.setRooms([
     roomWithAssignment('room-3', 'Room 3', live!.id, round.number, {
       session: { id: 'session-2', scoring: true, tossupsRead: 20, finalReceived: true },
-      result: { id: 'result-1', status: 'needs-review', fingerprint: 'abc', receivedAt: '2026-08-19T12:00:00Z' },
+      result: {
+        id: 'result-1',
+        matchId: 'scheduled-game-1',
+        status: 'needs-review',
+        fingerprint: 'abc',
+        receivedAt: '2026-08-19T12:00:00Z',
+      },
     }),
   ]);
   const before = snapshot(manager);

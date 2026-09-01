@@ -130,21 +130,26 @@ function teamIdFromMatchTeam(value: unknown): string | undefined {
   return typeof value.team.id === 'string' ? value.team.id : undefined;
 }
 
-function teamNameFromMatchTeam(value: unknown): string | undefined {
+function teamNameFromMatchTeam(value: unknown, objects: Map<string, Record<string, unknown>>): string | undefined {
   if (!isPlainObject(value) || !isPlainObject(value.team)) return undefined;
-  return typeof value.team.name === 'string' ? value.team.name : undefined;
+  const team = resolvedObject(value.team, objects);
+  return typeof team?.name === 'string' && team.name.trim() !== '' ? team.name : undefined;
 }
 
-function teamValues(match: Record<string, unknown>): {
+function teamValues(
+  match: Record<string, unknown>,
+  document: object,
+): {
   ids: (string | undefined)[];
   names: (string | undefined)[];
   present: boolean;
 } {
   const rawTeams = match.match_teams ?? match.matchTeams;
   if (!Array.isArray(rawTeams)) return { ids: [], names: [], present: false };
+  const objects = objectIndex(document);
   return {
     ids: rawTeams.map(teamIdFromMatchTeam),
-    names: rawTeams.map(teamNameFromMatchTeam),
+    names: rawTeams.map((team) => teamNameFromMatchTeam(team, objects)),
     present: true,
   };
 }
@@ -232,11 +237,23 @@ function metadataFingerprint(value: unknown): string | undefined {
 function compareTeams(
   match: Record<string, unknown>,
   expected: IResultReceiptContext,
+  expectedDocument: object | undefined,
+  receivedDocument: object,
   warnings: IResultDiscrepancy[],
 ): void {
-  const received = teamValues(match);
-  const expectedIds = [expected.expectedLeftTeamId, expected.expectedRightTeamId];
-  const expectedNames = [expected.expectedLeftTeamName, expected.expectedRightTeamName];
+  const received = teamValues(match, receivedDocument);
+  const expectedMatch = expectedDocument ? findResultMatch(expectedDocument) : undefined;
+  const expectedFromDocument = expectedMatch
+    ? teamValues(expectedMatch, expectedDocument as object)
+    : { ids: [], names: [], present: false };
+  const expectedIds = [
+    expectedFromDocument.ids[0] ?? expected.expectedLeftTeamId,
+    expectedFromDocument.ids[1] ?? expected.expectedRightTeamId,
+  ];
+  const expectedNames = [
+    expectedFromDocument.names[0] ?? expected.expectedLeftTeamName,
+    expectedFromDocument.names[1] ?? expected.expectedRightTeamName,
+  ];
   if (!received.present || received.ids.length !== 2) {
     addDiscrepancy(warnings, 'unreadable-result', 'two teams', received.present ? received.ids.length : 'missing');
     return;
@@ -244,12 +261,14 @@ function compareTeams(
 
   const expectedIdsAvailable = expectedIds.every((id) => id !== undefined);
   const receivedIdsAvailable = received.ids.every((id) => id !== undefined);
+  let idsReversed = false;
   if (expectedIdsAvailable && receivedIdsAvailable) {
     if (received.ids[0] === expectedIds[1] && received.ids[1] === expectedIds[0]) {
       addDiscrepancy(warnings, 'team-order-different', expectedIds, received.ids);
+      idsReversed = true;
     } else if (received.ids[0] !== expectedIds[0] || received.ids[1] !== expectedIds[1]) {
       addDiscrepancy(warnings, 'team-id-mismatch', expectedIds, received.ids);
-      if (received.ids.every((id) => id !== undefined && !expectedIds.includes(id))) {
+      if (received.ids.some((id) => id !== undefined && !expectedIds.includes(id))) {
         addDiscrepancy(warnings, 'unknown-team', expectedIds, received.ids);
       }
     }
@@ -258,15 +277,11 @@ function compareTeams(
   const expectedNamesAvailable = expectedNames.every((name) => name !== undefined);
   const receivedNamesAvailable = received.names.every((name) => name !== undefined);
   if (!expectedNamesAvailable || !receivedNamesAvailable) return;
-  if (
-    received.names[0] === expectedNames[1] &&
-    received.names[1] === expectedNames[0] &&
-    !(received.ids[0] === expectedIds[1] && received.ids[1] === expectedIds[0])
-  ) {
-    addDiscrepancy(warnings, 'team-order-different', expectedNames, received.names);
+  if (received.names[0] === expectedNames[1] && received.names[1] === expectedNames[0]) {
+    if (!idsReversed) addDiscrepancy(warnings, 'team-order-different', expectedNames, received.names);
   } else if (received.names[0] !== expectedNames[0] || received.names[1] !== expectedNames[1]) {
     addDiscrepancy(warnings, 'team-name-mismatch', expectedNames, received.names);
-    if (received.names.every((name) => name !== undefined && !expectedNames.includes(name))) {
+    if (received.names.some((name) => name !== undefined && !expectedNames.includes(name))) {
       addDiscrepancy(warnings, 'unknown-team', expectedNames, received.names);
     }
   }
@@ -280,11 +295,18 @@ function referenceId(value: unknown): string | undefined {
 }
 
 function objectIndex(document: object): Map<string, Record<string, unknown>> {
-  return new Map(
-    objectsIn(document)
-      .filter((entry) => typeof entry.id === 'string' && entry.id !== '')
-      .map((entry) => [entry.id as string, entry]),
-  );
+  const index = new Map<string, Record<string, unknown>>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (!isPlainObject(value)) return;
+    if (typeof value.id === 'string' && value.id !== '') index.set(value.id, value);
+    Object.values(value).forEach(visit);
+  };
+  visit(document);
+  return index;
 }
 
 function resolvedObject(
@@ -318,20 +340,30 @@ function comparePlayers(
   receivedDocument: object,
   warnings: IResultDiscrepancy[],
 ): void {
-  // A result normally carries the player objects it references. Prefer the assignment's copy when
-  // an id exists in both documents, but also resolve an id that is present only in the received
-  // document so a genuinely unknown player is reported rather than silently disappearing.
-  const objects = new Map([...objectIndex(receivedDocument), ...objectIndex(expectedDocument)]);
+  // A result normally carries the player objects it references. Resolve the assignment and received
+  // references against their own object graphs; merging the maps lets a received id silently inherit
+  // the assignment's name, which hides exactly the identity discrepancy this check is meant to find.
+  const expectedObjects = objectIndex(expectedDocument);
+  const receivedObjects = objectIndex(receivedDocument);
   const expectedTeamIds = [expected.expectedLeftTeamId, expected.expectedRightTeamId];
+  const expectedMatch = findResultMatch(expectedDocument);
+  const expectedTeams = expectedMatch ? teamValues(expectedMatch, expectedDocument) : undefined;
+  if (expectedTeams) {
+    expectedTeamIds[0] = expectedTeams.ids[0] ?? expectedTeamIds[0];
+    expectedTeamIds[1] = expectedTeams.ids[1] ?? expectedTeamIds[1];
+  }
   const rawTeams = match.match_teams ?? match.matchTeams;
   if (!Array.isArray(rawTeams)) return;
 
   rawTeams.slice(0, 2).forEach((rawTeam, position) => {
-    const expectedTeam = objects.get(expectedTeamIds[position] ?? '');
-    const expectedPlayers = expectedTeam ? playerIdentityValues(expectedTeam.players, objects) : [];
+    const receivedTeamId = teamIdFromMatchTeam(rawTeam);
+    // A result's own team id is authoritative. Positional fallback is only for old name-shaped
+    // results that genuinely carry no team identifier.
+    const expectedTeam = expectedObjects.get(receivedTeamId ?? expectedTeamIds[position] ?? '');
+    const expectedPlayers = expectedTeam ? playerIdentityValues(expectedTeam.players, expectedObjects) : [];
     if (expectedPlayers.length === 0) return;
     const receivedPlayers = isPlainObject(rawTeam)
-      ? playerIdentityValues(rawTeam.match_players ?? rawTeam.matchPlayers, objects)
+      ? playerIdentityValues(rawTeam.match_players ?? rawTeam.matchPlayers, receivedObjects)
       : [];
     if (receivedPlayers.length === 0) return;
 
@@ -346,37 +378,23 @@ function comparePlayers(
       expectedPlayers.flatMap((player) => (player.id && player.name ? [[player.id, player.name] as const] : [])),
     );
 
-    if (receivedIds.some((id) => !expectedIds.includes(id))) {
-      addDiscrepancy(warnings, 'unknown-player', expectedIds, receivedIds);
+    let unknown = false;
+    let nameMismatch = false;
+    let idMismatch = false;
+    for (const player of receivedPlayers) {
+      const knownById = player.id !== undefined && expectedIds.includes(player.id);
+      const knownByName = player.name !== undefined && expectedNames.includes(player.name);
+      if (!knownById && !knownByName) unknown = true;
+      if (knownById && player.id && player.name && expectedNameById.get(player.id) !== player.name) {
+        nameMismatch = true;
+      }
+      if (knownByName && player.name && player.id && expectedIdByName.get(player.name) !== player.id) {
+        idMismatch = true;
+      }
     }
-    if (receivedNames.some((name) => !expectedNames.includes(name))) {
-      addDiscrepancy(warnings, 'unknown-player', expectedNames, receivedNames);
-    }
-    if (
-      receivedIds.some((id) => expectedIds.includes(id) && expectedNameById.get(id) !== undefined) &&
-      receivedPlayers.some((player) => player.id && player.name && expectedNameById.get(player.id) !== player.name)
-    ) {
-      addDiscrepancy(warnings, 'player-name-mismatch', expectedNames, receivedNames);
-    }
-    if (
-      receivedPlayers.some(
-        (player) =>
-          player.name &&
-          expectedIdByName.has(player.name) &&
-          player.id &&
-          expectedIdByName.get(player.name) !== player.id,
-      )
-    ) {
-      addDiscrepancy(warnings, 'player-id-mismatch', expectedIds, receivedIds);
-    }
-    if (
-      receivedIds.length > 0 &&
-      expectedIds.length > 0 &&
-      receivedIds.length !== expectedIds.length &&
-      receivedIds.every((id) => expectedIds.includes(id))
-    ) {
-      addDiscrepancy(warnings, 'roster-different', expectedIds, receivedIds);
-    }
+    if (unknown) addDiscrepancy(warnings, 'unknown-player', expectedIds, receivedIds);
+    if (nameMismatch) addDiscrepancy(warnings, 'player-name-mismatch', expectedNames, receivedNames);
+    if (idMismatch) addDiscrepancy(warnings, 'player-id-mismatch', expectedIds, receivedIds);
   });
 }
 
@@ -398,7 +416,12 @@ export function resultDiscrepancies(
   if (expected.tournamentId && identity?.tournamentId && identity.tournamentId !== expected.tournamentId) {
     addDiscrepancy(warnings, 'tournament-id-mismatch', expected.tournamentId, identity.tournamentId);
   }
-  if (typeof source.tournamentId === 'string' && source.tournamentId !== expected.tournamentId) {
+  if (
+    typeof expected.tournamentId === 'string' &&
+    expected.tournamentId.trim() !== '' &&
+    typeof source.tournamentId === 'string' &&
+    source.tournamentId !== expected.tournamentId
+  ) {
     addDiscrepancy(warnings, 'source-tournament-different', expected.tournamentId, source.tournamentId);
   }
   if (!identity?.matchId) {
@@ -460,7 +483,8 @@ export function resultDiscrepancies(
   if (expected.roomId && typeof receivedRoomId === 'string' && receivedRoomId !== expected.roomId) {
     addDiscrepancy(warnings, 'room-mismatch', expected.roomId, receivedRoomId);
   }
-  compareTeams(match, expected, warnings);
+  const receivedDocument = isPlainObject(document) ? document : {};
+  compareTeams(match, expected, expectedDocument, receivedDocument, warnings);
 
   if (expectedDocument) {
     const metadataChecks: Array<{
@@ -482,7 +506,7 @@ export function resultDiscrepancies(
         addDiscrepancy(warnings, check.code, metadataFingerprint(expectedValue), metadataFingerprint(receivedValue));
       }
     }
-    comparePlayers(match, expected, expectedDocument, isPlainObject(document) ? document : {}, warnings);
+    comparePlayers(match, expected, expectedDocument, receivedDocument, warnings);
   }
 
   return warnings;

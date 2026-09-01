@@ -206,9 +206,21 @@ export default class RoomsManager {
     await this.send({ kind: 'clearAssignment', roomId });
   }
 
-  async abandonSession(sessionId: string, reason?: string): Promise<{ abandoned: boolean; warning?: string }> {
+  async abandonSession(
+    sessionId: string,
+    reason?: string,
+  ): Promise<{ abandoned: boolean; warning?: string; reason?: string }> {
     const reply = await this.send({ kind: 'abandonSession', sessionId, reason });
-    if (!reply.ok || !('abandoned' in reply) || !reply.abandoned) return { abandoned: false };
+    if (!reply.ok || !('abandoned' in reply) || !reply.abandoned) {
+      const rejectionReason = reply.ok ? 'The scoring session could not be abandoned.' : reply.error;
+      // Refresh even on rejection: the session may have been resolved by another control-table
+      // action while this request was in flight. Restore the rejection after refresh, because a
+      // successful status poll otherwise clears the only explanation shown by the page.
+      await this.refresh();
+      this.lastError = rejectionReason;
+      this.dataChangedReactCallback();
+      return { abandoned: false, reason: rejectionReason };
+    }
     // The command response is intentionally small; refresh so the released assignment and terminal
     // session status are reflected in the Rooms table before the next click.
     await this.refresh();
@@ -239,6 +251,13 @@ export default class RoomsManager {
       return `it is assigned to ${room.name}`;
     }
     return undefined;
+  }
+
+  /** Whether a room has been issued this pairing or has retained its final. Used to explain procedure edits. */
+  hasReceivedResultForScheduledGame(scheduledGameId: string): boolean {
+    return this.status.rooms.some(
+      (room) => room.assignment?.matchId === scheduledGameId || room.result?.matchId === scheduledGameId,
+    );
   }
 
   /**

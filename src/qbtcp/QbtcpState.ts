@@ -145,6 +145,8 @@ export interface IResultReviewRequest {
   decision: ResultReviewDecision;
   existingResultId?: string;
   reason?: string;
+  /** Set by the shared importer after it has committed the incoming QBJ as a Match. */
+  imported?: boolean;
 }
 
 /**
@@ -188,6 +190,8 @@ export interface IReceivedResult {
   dismissedAt?: string;
   /** Compatibility resolution metadata retained for existing consumers. */
   resolution?: ResultDiscrepancyResolution;
+  /** The corresponding tournament Match was committed by the importer. */
+  importedMatchId?: string;
   /** Round the result claims, for display before it is imported. */
   roundNumber?: number;
   /** Assignment revision claimed by the result, when present. */
@@ -342,6 +346,7 @@ export interface IRoomView {
   };
   result?: {
     id: string;
+    matchId: string;
     status: ReceivedResultStatus;
     fingerprint: string;
     receivedAt: string;

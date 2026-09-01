@@ -10,6 +10,7 @@ import {
   readResultIdentity,
   readResultSourceMetadata,
 } from '../qbtcp/ResultFingerprint';
+import { resultDiscrepancies } from '../qbtcp/ResultDiscrepancy';
 import { IRoomAssignment } from '../qbtcp/QbtcpState';
 import { buildAssignmentDocument } from '../renderer/DataModel/QbjAssignment';
 import { makeTestTournament, roundNumbered, teamNamed } from './QbtcpFixtures';
@@ -103,9 +104,147 @@ test('prefers standard QBJ identity and team IDs when they are present', () => {
   };
   const match = result.objects.find((entry) => entry.type === 'Match');
   if (!match) throw new Error('fixture has no Match');
+  match._qbtcp = { round_revision: 2, assignment_revision: 3 };
+  match._qbsheet_source = { roundRevision: 9, assignmentRevision: 9 };
 
-  expect(readResultIdentity(result)).toMatchObject({ matchId: assignment.matchId });
-  expect(validateResultAgainstAssignment(result, assignment)).toBeUndefined();
+  expect(readResultIdentity(result)).toMatchObject({
+    matchId: assignment.matchId,
+    roundRevision: 2,
+    assignmentRevision: 3,
+  });
+});
+
+test('compares referenced team and player objects from the received document without roster-subset warnings', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const context = {
+    tournamentId,
+    roomId: assignment.roomId,
+    roomName: 'Room 204',
+    sessionId: 'session-1',
+    expectedMatchId: assignment.matchId,
+    expectedRoundNumber: assignment.roundNumber,
+    expectedAssignmentRevision: assignment.revision,
+    expectedRoundRevision: assignment.roundRevision,
+    expectedLeftTeamId: assignment.leftTeamId,
+    expectedRightTeamId: assignment.rightTeamId,
+    expectedLeftTeamName: assignment.leftTeamName,
+    expectedRightTeamName: assignment.rightTeamName,
+  };
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const leftTeam = received.objects.find((entry) => entry.type === 'Team' && entry.id === assignment.leftTeamId);
+  const leftPlayer = leftTeam?.players?.[0] as Record<string, unknown> | undefined;
+  if (!leftTeam || !leftPlayer) throw new Error('fixture has no referenced team/player');
+
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  const matchTeams = match?.match_teams as { team: { $ref: string }; match_players?: unknown[] }[] | undefined;
+  if (!matchTeams?.[0] || typeof leftPlayer.id !== 'string') throw new Error('fixture match has no left team');
+  matchTeams[0].match_players = [{ player: { $ref: leftPlayer.id } }];
+  leftTeam.name = 'Ninety Six Renamed';
+  leftPlayer.name = 'Sarah Renamed';
+  const codes = resultDiscrepancies(received, context, assignment.document).map((warning) => warning.code);
+
+  expect(codes).toContain('team-name-mismatch');
+  expect(codes).toContain('player-name-mismatch');
+  expect(codes).not.toContain('unknown-player');
+  expect(codes).not.toContain('roster-different');
+});
+
+test('recognizes reversed referenced teams without misclassifying either team as unknown', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  if (!match) throw new Error('fixture has no Match');
+  const matchTeams = match.match_teams as unknown[];
+  match.match_teams = matchTeams.slice().reverse();
+
+  const codes = resultDiscrepancies(
+    received,
+    {
+      tournamentId,
+      roomId: assignment.roomId,
+      roomName: 'Room 204',
+      sessionId: 'session-1',
+      expectedMatchId: assignment.matchId,
+      expectedRoundNumber: assignment.roundNumber,
+      expectedAssignmentRevision: assignment.revision,
+      expectedRoundRevision: assignment.roundRevision,
+      expectedLeftTeamId: assignment.leftTeamId,
+      expectedRightTeamId: assignment.rightTeamId,
+      expectedLeftTeamName: assignment.leftTeamName,
+      expectedRightTeamName: assignment.rightTeamName,
+    },
+    assignment.document,
+  ).map((warning) => warning.code);
+
+  expect(codes).toContain('team-order-different');
+  expect(codes).not.toContain('team-id-mismatch');
+  expect(codes).not.toContain('team-name-mismatch');
+  expect(codes).not.toContain('unknown-team');
+});
+
+test('classifies a known player name with a different id, and a genuinely unknown player, independently', () => {
+  const { assignment, tournamentId } = buildFixture();
+  const context = {
+    tournamentId,
+    roomId: assignment.roomId,
+    roomName: 'Room 204',
+    sessionId: 'session-1',
+    expectedMatchId: assignment.matchId,
+    expectedRoundNumber: assignment.roundNumber,
+    expectedAssignmentRevision: assignment.revision,
+    expectedRoundRevision: assignment.roundRevision,
+    expectedLeftTeamId: assignment.leftTeamId,
+    expectedRightTeamId: assignment.rightTeamId,
+    expectedLeftTeamName: assignment.leftTeamName,
+    expectedRightTeamName: assignment.rightTeamName,
+  };
+
+  const received = JSON.parse(JSON.stringify(assignment.document)) as {
+    objects: Record<string, any>[];
+  };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  const leftTeam = received.objects.find((entry) => entry.type === 'Team' && entry.id === assignment.leftTeamId);
+  const expectedPlayer = leftTeam?.players?.[0] as Record<string, unknown> | undefined;
+  if (!match || !leftTeam || !expectedPlayer) throw new Error('fixture has no match/team/player');
+
+  const receivedTeams = match.match_teams as { team: { $ref: string }; match_players?: unknown[] }[];
+  const leftMatchTeam = receivedTeams[0];
+  if (!leftMatchTeam) throw new Error('fixture match has no left team');
+  leftMatchTeam.match_players = [{ player: { $ref: 'Player_reassigned' } }, { player: { $ref: 'Player_unknown' } }];
+  received.objects.push(
+    { type: 'Player', id: 'Player_reassigned', name: expectedPlayer.name },
+    { type: 'Player', id: 'Player_unknown', name: 'Unknown Player' },
+  );
+
+  const codes = resultDiscrepancies(received, context, assignment.document).map((warning) => warning.code);
+  expect(codes).toContain('player-id-mismatch');
+  expect(codes).toContain('unknown-player');
+});
+
+test('does not call a foreign source tournament different when the expected id is unavailable', () => {
+  const { assignment } = buildFixture();
+  const received = JSON.parse(JSON.stringify(assignment.document)) as { objects: Record<string, unknown>[] };
+  const match = received.objects.find((entry) => entry.type === 'Match');
+  if (!match) throw new Error('fixture has no Match');
+  match._qbsheet_source = { tournamentId: 'foreign-tournament' };
+
+  const warnings = resultDiscrepancies(
+    received,
+    {
+      tournamentId: '',
+      roomId: assignment.roomId,
+      roomName: 'Room 204',
+      sessionId: 'session-1',
+      expectedMatchId: assignment.matchId,
+    },
+    assignment.document,
+  );
+
+  expect(warnings.map((warning) => warning.code)).not.toContain('source-tournament-different');
 });
 
 test('finds inline matches under top-level Round objects', () => {
@@ -144,13 +283,26 @@ test('deduplicates distinct Match objects that carry the same stable identity', 
 
 test('deduplicates by Match ID before fingerprint and recognizes retries of a correction', () => {
   const recorded = [
-    { id: 'result-original', matchId: 'Match_one', fingerprint: 'score-a' },
-    { id: 'result-correction', matchId: 'Match_one', fingerprint: 'score-b' },
+    {
+      id: 'result-original',
+      matchId: 'Match_one',
+      fingerprint: 'score-a',
+      status: 'superseded' as const,
+      supersededByResultId: 'result-correction',
+      receivedAt: '2026-08-19T12:00:00.000Z',
+    },
+    {
+      id: 'result-correction',
+      matchId: 'Match_one',
+      fingerprint: 'score-b',
+      status: 'accepted' as const,
+      receivedAt: '2026-08-19T12:01:00.000Z',
+    },
   ];
 
   expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-a' }, recorded)).toEqual({
-    kind: 'duplicate',
-    existingId: 'result-original',
+    kind: 'conflict',
+    existingId: 'result-correction',
   });
   expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-b' }, recorded)).toEqual({
     kind: 'duplicate',
@@ -158,7 +310,7 @@ test('deduplicates by Match ID before fingerprint and recognizes retries of a co
   });
   expect(compareToRecorded({ matchId: 'Match_one', fingerprint: 'score-c' }, recorded)).toEqual({
     kind: 'conflict',
-    existingId: 'result-original',
+    existingId: 'result-correction',
   });
   expect(compareToRecorded({ matchId: 'Match_two', fingerprint: 'score-a' }, recorded)).toEqual({ kind: 'new' });
 });

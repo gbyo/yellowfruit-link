@@ -115,6 +115,9 @@ export default class MatchImportResultsManager {
         decision,
         ...(decision === 'keep-existing' || decision === 'supersede' ? { existingResultId } : {}),
         ...(result.qbtcpReviewReason?.trim() ? { reason: result.qbtcpReviewReason.trim().slice(0, 1000) } : {}),
+        // The shared importer is the authority that says a QBJ became a YellowFruit Match. The
+        // server uses this marker to avoid mutating an unrelated accepted receipt during Keep.
+        imported: decision === 'accept' || decision === 'supersede',
       });
     }
     return decisions;

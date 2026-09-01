@@ -1,5 +1,6 @@
 import { useContext, useState } from 'react';
 import {
+  Alert,
   Button,
   Checkbox,
   Dialog,
@@ -39,7 +40,9 @@ function RoundProcedureDialog(props: IRoundProcedureDialogProps) {
   const [handoffInstruction, setHandoffInstruction] = useState(
     round.handoffInstruction ?? tournManager.tournament.handoffInstruction ?? '',
   );
-  const readOnly = tournManager.tournament.hasMatchData;
+  const receivedResults = round.scheduledGames.filter((game) =>
+    tournManager.roomsManager.hasReceivedResultForScheduledGame(game.id),
+  ).length;
 
   const save = () => {
     round.roomProcedure = customizeProcedure ? normalizeRoomProcedure(procedure) : undefined;
@@ -56,11 +59,17 @@ function RoundProcedureDialog(props: IRoundProcedureDialogProps) {
           <Typography variant="body2" color="text.secondary">
             Use the tournament defaults for this round, or save a complete round-specific procedure snapshot.
           </Typography>
+          {receivedResults > 0 && (
+            <Alert severity="warning">
+              {receivedResults === 1 ? 'One game in this round has' : `${receivedResults} games in this round have`}{' '}
+              already been issued to a room or returned a result. Existing assignments keep the procedure they were
+              given; this change applies to future assignments.
+            </Alert>
+          )}
           <FormControlLabel
             control={
               <Checkbox
                 checked={customizeProcedure}
-                disabled={readOnly}
                 onChange={(event) => {
                   setCustomizeProcedure(event.target.checked);
                   if (event.target.checked)
@@ -74,17 +83,13 @@ function RoundProcedureDialog(props: IRoundProcedureDialogProps) {
             procedure={procedure}
             handoffInstruction={handoffInstruction}
             showHandoff={false}
-            disabled={readOnly || !customizeProcedure}
+            disabled={!customizeProcedure}
             onProcedureChange={setProcedure}
             onHandoffInstructionChange={setHandoffInstruction}
           />
           <FormControlLabel
             control={
-              <Checkbox
-                checked={customizeHandoff}
-                disabled={readOnly}
-                onChange={(event) => setCustomizeHandoff(event.target.checked)}
-              />
+              <Checkbox checked={customizeHandoff} onChange={(event) => setCustomizeHandoff(event.target.checked)} />
             }
             label="Customize handoff instruction for this round"
           />
@@ -96,7 +101,6 @@ function RoundProcedureDialog(props: IRoundProcedureDialogProps) {
               maxRows={5}
               label="Handoff instruction"
               value={handoffInstruction}
-              disabled={readOnly}
               helperText="Optional guidance for the scorekeeper when this game changes hands."
               onChange={(event) => setHandoffInstruction(event.target.value)}
             />
@@ -109,7 +113,7 @@ function RoundProcedureDialog(props: IRoundProcedureDialogProps) {
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={save} disabled={readOnly} variant="contained">
+        <Button onClick={save} variant="contained">
           Save
         </Button>
       </DialogActions>

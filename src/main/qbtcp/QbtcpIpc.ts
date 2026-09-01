@@ -155,6 +155,7 @@ function buildStatus(instance: QbtcpServer): IQbtcpServerStatus {
         ? {
             result: {
               id: result.id,
+              matchId: result.matchId,
               status: result.status,
               fingerprint: result.fingerprint,
               receivedAt: result.receivedAt,
@@ -288,6 +289,7 @@ async function runCommand(command: QbtcpCommand): Promise<QbtcpCommandResult> {
         decision: command.decision,
         ...(command.existingResultId ? { existingResultId: command.existingResultId } : {}),
         ...(command.reason !== undefined ? { reason: command.reason } : {}),
+        ...(command.imported === true ? { imported: true } : {}),
       });
       if (!outcome.reviewed) return { ok: false, error: outcome.reason ?? 'That result could not be reviewed.' };
       return { ok: true, status: buildStatus(instance) };

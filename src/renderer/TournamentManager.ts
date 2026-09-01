@@ -49,6 +49,7 @@ import { PairingGenerationMode, scheduledGameLockReason } from './DataModel/Pair
 import {
   IReceivedResult,
   IResultDiscrepancy,
+  IResultReviewRequest,
   IQbtcpRosterPlayerRequest,
   QbtcpRosterPlayerOutcome,
   ResultReviewDecision,
@@ -1722,7 +1723,7 @@ export class TournamentManager {
     this.matchImportResultsManager.openModal(importResults, round);
   }
 
-  closeMatchImportModal(shouldSave: boolean) {
+  closeMatchImportModal(shouldSave: boolean): Promise<void> {
     // Snapshot decisions before closeModal resets the review rows. A QBTCP receipt is already
     // durable in the main process, so cancelling intentionally leaves it in the Rooms review queue;
     // saving sends the director's explicit Replace/Keep/Dismiss decision below.
@@ -1731,7 +1732,7 @@ export class TournamentManager {
       : new Map<string, { decision: ResultReviewDecision }>();
     this.matchImportResultsManager.closeModal(shouldSave);
     this.onDataChanged(!shouldSave);
-    this.finishRoomsBookkeeping(shouldSave, qbtcpDecisions);
+    return this.finishRoomsBookkeeping(shouldSave, qbtcpDecisions);
   }
 
   /**
@@ -1748,10 +1749,7 @@ export class TournamentManager {
    * "accepted". Marking the file dirty is not enough on its own, because dirty only means the next
    * save will include it.
    */
-  private async finishRoomsBookkeeping(
-    shouldSave: boolean,
-    qbtcpDecisions: Map<string, { decision: ResultReviewDecision; existingResultId?: string; reason?: string }>,
-  ) {
+  private async finishRoomsBookkeeping(shouldSave: boolean, qbtcpDecisions: Map<string, IResultReviewRequest>) {
     this.roomsBookkeepingInProgress = true;
     const documents = this.pendingFileResultsToRecord;
     const resultIds = this.pendingQbtcpResultIds;
@@ -1789,6 +1787,7 @@ export class TournamentManager {
             decision: decision.decision,
             ...(decision.existingResultId ? { existingResultId: decision.existingResultId } : {}),
             ...(decision.reason ? { reason: decision.reason } : {}),
+            ...(decision.imported ? { imported: true } : {}),
           })) as QbtcpCommandResult | undefined;
           if (!reply?.ok) {
             this.makeToast(

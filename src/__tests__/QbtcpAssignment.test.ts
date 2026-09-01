@@ -156,6 +156,67 @@ test('a round procedure and handoff override are resolved into the assignment sn
   expect(extension.scorekeeper).toEqual({ timed: false });
 });
 
+test('procedure changes affect future assignments without rewriting an issued snapshot', () => {
+  const tournament = makeTestTournament();
+  const leftTeam = teamNamed(tournament, 'Ninety Six');
+  const rightTeam = teamNamed(tournament, 'Greenwood');
+
+  const buildForRound = (roundNumber: number, matchId: string) => {
+    const round = roundNumbered(tournament, roundNumber);
+    const phase = tournament.findPhaseByRound(round);
+    if (!phase) throw new Error(`fixture round ${roundNumber} has no phase`);
+    return buildAssignmentDocument({
+      tournament,
+      phase,
+      round,
+      leftTeam,
+      rightTeam,
+      matchId,
+      roomName: 'Room 204',
+      roomId: 'room-204',
+      roundRevision: 1,
+      assignmentRevision: 1,
+    });
+  };
+  const extensionOf = (document: object) => objectsOfType(document, 'Match')[0]._qbtcp as Record<string, unknown>;
+
+  const alreadyIssued = buildForRound(2, 'Match_already_issued');
+  const alreadyIssuedBytes = JSON.stringify(alreadyIssued);
+
+  tournament.roomProcedure = {
+    version: 3,
+    halves: true,
+    breaks: [{ afterTossup: 10, label: 'Mid-game' }],
+    halfLengthMinutes: 25,
+    timeoutsPerTeam: 1,
+    timeoutDurationSeconds: 30,
+    protestCheckpoints: 'phase-boundaries',
+    substitutionPolicy: 'any-boundary',
+  };
+  tournament.handoffInstruction = 'Return the scoresheet to the director table.';
+
+  const futureDefault = buildForRound(3, 'Match_future_default');
+  const roundOverride = roundNumbered(tournament, 4);
+  roundOverride.roomProcedure = {
+    version: 3,
+    halves: false,
+    timeoutsPerTeam: 2,
+    timeoutDurationSeconds: 45,
+    protestCheckpoints: 'strict-overtime',
+    substitutionPolicy: 'breaks-timeouts-overtime',
+  };
+  roundOverride.handoffInstruction = 'Use the printed round packet.';
+  const futureOverride = buildForRound(4, 'Match_future_override');
+
+  expect(extensionOf(alreadyIssued).procedure).toEqual({ version: 3, halves: false, timeoutsPerTeam: 0 });
+  expect(extensionOf(alreadyIssued).handoff_instruction).toBeUndefined();
+  expect(JSON.stringify(alreadyIssued)).toBe(alreadyIssuedBytes);
+  expect(extensionOf(futureDefault).procedure).toEqual(tournament.roomProcedure);
+  expect(extensionOf(futureDefault).handoff_instruction).toBe(tournament.handoffInstruction);
+  expect(extensionOf(futureOverride).procedure).toEqual(roundOverride.roomProcedure);
+  expect(extensionOf(futureOverride).handoff_instruction).toBe(roundOverride.handoffInstruction);
+});
+
 test('_qbtcp restates no identity that standard QBJ already carries', () => {
   const { document } = buildFixtureAssignment();
   const extension = objectsOfType(document, 'Match')[0]._qbtcp as Record<string, unknown>;

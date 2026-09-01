@@ -9,7 +9,6 @@ function RoomProcedureSettingsCard() {
   const tournManager = useContext(TournamentContext);
   const [procedure, setProcedure] = useSubscription(tournManager.tournament.roomProcedure);
   const [handoffInstruction, setHandoffInstruction] = useSubscription(tournManager.tournament.handoffInstruction ?? '');
-  const readOnly = tournManager.tournament.hasMatchData;
 
   return (
     <YfCard title="Room procedure defaults">
@@ -19,7 +18,6 @@ function RoomProcedureSettingsCard() {
       <RoomProcedureFields
         procedure={procedure}
         handoffInstruction={handoffInstruction}
-        disabled={readOnly}
         onProcedureChange={(nextProcedure) => {
           setProcedure(nextProcedure);
           tournManager.tournament.setRoomProcedure(nextProcedure);

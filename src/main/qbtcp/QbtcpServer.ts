@@ -567,6 +567,7 @@ export default class QbtcpServer {
       ...(reason ? { reason } : {}),
       ...(targetResultId ? { targetResultId } : {}),
     };
+    const imported = (request.decision === 'accept' || request.decision === 'supersede') && request.imported === true;
 
     if (request.decision === 'supersede' && target) {
       target.status = 'superseded';
@@ -581,9 +582,13 @@ export default class QbtcpServer {
       result.supersedesResultId = target.id;
       result.resolution = 'accepted';
       result.review = review;
+      if (imported && result.matchId) result.importedMatchId = result.matchId;
       resolveResultWarnings(result, 'accepted');
     } else if (request.decision === 'keep-existing' && target) {
-      if (target.status === 'needs-review' || target.status === 'conflict') {
+      // A Keep decision is bookkeeping for a Match that already exists. A retained QBTCP result
+      // may look accepted in the adapter while its importer was cancelled or failed; promoting that
+      // evidence here would make the review queue lie about a Match that is not in the tournament.
+      if (target.importedMatchId && (target.status === 'needs-review' || target.status === 'conflict')) {
         target.status = 'accepted';
         target.resolution = 'accepted';
         resolveResultWarnings(target, 'accepted');
@@ -604,9 +609,12 @@ export default class QbtcpServer {
       result.status = 'accepted';
       result.resolution = 'accepted';
       result.review = review;
+      if (imported && result.matchId) result.importedMatchId = result.matchId;
       resolveResultWarnings(result, 'accepted');
     }
 
+    this.pruneResolvedSessionAssignment(result.sessionId);
+    if (target) this.pruneResolvedSessionAssignment(target.sessionId);
     await this.store.save(this.state);
     this.hooks.onStateChanged();
     return { reviewed: true };
@@ -629,8 +637,10 @@ export default class QbtcpServer {
     if (status === 'accepted') {
       result.resolution = 'accepted';
       result.review ??= { decision: 'accept', resolvedAt: new Date().toISOString() };
+      if (result.matchId) result.importedMatchId = result.matchId;
       resolveResultWarnings(result, 'accepted');
     }
+    this.pruneResolvedSessionAssignment(result.sessionId);
     await this.store.save(this.state);
     this.hooks.onStateChanged();
   }
@@ -683,7 +693,14 @@ export default class QbtcpServer {
             result.fingerprint !== identity.fingerprint ||
             (result.status !== 'needs-review' && result.status !== 'conflict'),
         )
-        .map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
+        .map((r) => ({
+          id: r.id,
+          matchId: r.matchId,
+          fingerprint: r.fingerprint,
+          status: r.status,
+          receivedAt: r.receivedAt,
+          supersededByResultId: r.supersededByResultId,
+        })),
     );
   }
 
@@ -733,6 +750,7 @@ export default class QbtcpServer {
         // file against every one of its games would store the same day of play ten times over.
         document: stripCredentialKeys(identity.match) as object,
         receivedAt: new Date().toISOString(),
+        ...(identity.matchId ? { importedMatchId: identity.matchId } : {}),
         ...(identity.roundNumber !== undefined ? { roundNumber: identity.roundNumber } : {}),
       });
       recorded = true;
@@ -1321,6 +1339,8 @@ export default class QbtcpServer {
       sendJson(response, 200, {
         accepted: false,
         received: true,
+        // Preserve the legacy warning signal for clients that surface `review_required` on a
+        // nonfatal progress response. This does not create a durable result review item.
         review_required: true,
         warning_codes: [snapshotWarning.code],
         warnings: [snapshotWarning],
@@ -1399,7 +1419,14 @@ export default class QbtcpServer {
         ? { kind: 'new' }
         : compareToRecorded(
             { matchId: identity?.matchId, fingerprint },
-            this.state.results.map((r) => ({ id: r.id, matchId: r.matchId, fingerprint: r.fingerprint })),
+            this.state.results.map((r) => ({
+              id: r.id,
+              matchId: r.matchId,
+              fingerprint: r.fingerprint,
+              status: r.status,
+              receivedAt: r.receivedAt,
+              supersededByResultId: r.supersededByResultId,
+            })),
           );
 
     if (comparison.kind === 'duplicate') {
@@ -1410,6 +1437,7 @@ export default class QbtcpServer {
         session.status = 'final-received';
         session.finalReceived = true;
         session.updatedAt = new Date().toISOString();
+        this.pruneResolvedSessionAssignment(session.id);
         await this.store.save(this.state);
       }
       sendJson(
@@ -1794,6 +1822,26 @@ export default class QbtcpServer {
     if (session.assignmentDocument) return session.assignmentDocument;
     return this.state.assignments.find((entry) => entry.roomId === session.roomId && entry.matchId === session.matchId)
       ?.document;
+  }
+
+  /**
+   * Drop the duplicate assignment snapshot once its session is terminal and no result from it is
+   * still waiting for a director. The immutable assignment context remains for recovery/audit, and
+   * unresolved results retain their own exact document; this only removes the second copy of a QBJ
+   * after it has stopped being needed for comparison.
+   */
+  private pruneResolvedSessionAssignment(sessionId: string): void {
+    const session = this.state.sessions.find((entry) => entry.id === sessionId);
+    if (!session || sessionStatus(session) === 'open') return;
+    if (
+      this.state.results.some(
+        (result) =>
+          result.sessionId === sessionId && (result.status === 'needs-review' || result.status === 'conflict'),
+      )
+    ) {
+      return;
+    }
+    delete session.assignmentDocument;
   }
 }
 
