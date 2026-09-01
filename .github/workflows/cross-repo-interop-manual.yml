@@ -33,17 +33,24 @@ jobs:
         id: resolve-qbsheet
         env:
           REQUESTED_REF: ${{ inputs.qbsheet_ref }}
-          CANDIDATE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          candidate="${REQUESTED_REF:-$CANDIDATE_REF}"
-          if [ -z "$candidate" ]; then candidate=main; fi
-          remote_line="$(git ls-remote https://github.com/gbyo/qbsheet.git "refs/heads/$candidate" || true)"
-          if [ -z "$remote_line" ]; then
-            candidate=main
-            remote_line="$(git ls-remote https://github.com/gbyo/qbsheet.git "refs/heads/$candidate")"
+          candidate="${REQUESTED_REF:-main}"
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          git init --quiet "$verify_dir"
+
+          if ! git -C "$verify_dir" fetch --quiet --no-tags --depth=1 \
+            https://github.com/gbyo/qbsheet.git "$candidate"; then
+            if [ -n "$REQUESTED_REF" ]; then
+              echo "::error title=Invalid QBSheet ref::Explicit qbsheet_ref '$REQUESTED_REF' does not resolve to a branch, tag, full ref, or commit in gbyo/qbsheet." >&2
+            else
+              echo "::error title=QBSheet default ref unavailable::Default qbsheet_ref 'main' could not be resolved in gbyo/qbsheet." >&2
+            fi
+            exit 1
           fi
-          sha="${remote_line%%$'\t'*}"
+
+          sha="$(git -C "$verify_dir" rev-parse 'FETCH_HEAD^{commit}')"
           echo "ref=$candidate" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
