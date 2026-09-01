@@ -33,17 +33,64 @@ jobs:
         id: resolve-qbsheet
         env:
           REQUESTED_REF: ${{ inputs.qbsheet_ref }}
-          CANDIDATE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          candidate="${REQUESTED_REF:-$CANDIDATE_REF}"
-          if [ -z "$candidate" ]; then candidate=main; fi
-          remote_line="$(git ls-remote https://github.com/gbyo/qbsheet.git "refs/heads/$candidate" || true)"
-          if [ -z "$remote_line" ]; then
-            candidate=main
-            remote_line="$(git ls-remote https://github.com/gbyo/qbsheet.git "refs/heads/$candidate")"
+          repo=https://github.com/gbyo/qbsheet.git
+          candidate="${REQUESTED_REF:-main}"
+          sha=""
+
+          resolve_named_ref() {
+            local exact_ref="$1"
+            local remote_lines line_sha line_ref fallback_sha=""
+
+            if ! remote_lines="$(git ls-remote "$repo" "$exact_ref" "$exact_ref^{}")"; then
+              echo "::error title=QBSheet ref lookup failed::Unable to query gbyo/qbsheet for '$candidate'." >&2
+              exit 1
+            fi
+
+            while IFS=$'\t' read -r line_sha line_ref; do
+              if [ "$line_ref" = "$exact_ref^{}" ]; then
+                sha="$line_sha"
+                return 0
+              fi
+              if [ "$line_ref" = "$exact_ref" ]; then
+                fallback_sha="$line_sha"
+              fi
+            done <<< "$remote_lines"
+
+            if [ -n "$fallback_sha" ]; then
+              sha="$fallback_sha"
+              return 0
+            fi
+            return 1
+          }
+
+          if [[ "$candidate" == refs/* ]]; then
+            resolve_named_ref "$candidate" || true
+          else
+            if ! resolve_named_ref "refs/heads/$candidate"; then
+              resolve_named_ref "refs/tags/$candidate" || true
+            fi
+
+            if [ -z "$sha" ] && [[ "$candidate" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              verify_dir="$(mktemp -d)"
+              trap 'rm -rf "$verify_dir"' EXIT
+              git init --quiet "$verify_dir"
+              if git -C "$verify_dir" fetch --quiet --no-tags --depth=1 "$repo" "$candidate"; then
+                sha="$(git -C "$verify_dir" rev-parse 'FETCH_HEAD^{commit}')"
+              fi
+            fi
           fi
-          sha="${remote_line%%$'\t'*}"
+
+          if [ -z "$sha" ]; then
+            if [ -n "$REQUESTED_REF" ]; then
+              echo "::error title=Invalid QBSheet ref::Explicit qbsheet_ref '$REQUESTED_REF' does not resolve to a branch, tag, full ref, or commit in gbyo/qbsheet." >&2
+            else
+              echo "::error title=QBSheet default ref unavailable::Default qbsheet_ref 'main' could not be resolved in gbyo/qbsheet." >&2
+            fi
+            exit 1
+          fi
+
           echo "ref=$candidate" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
